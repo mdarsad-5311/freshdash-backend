@@ -43,3 +43,4 @@ The server runs on: `http://127.0.0.1:8000/`
   "message": "FreshDash API is running"
 }
 ```
+
