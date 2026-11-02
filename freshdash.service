@@ -1,0 +1,21 @@
+[Unit]
+Description=FreshDash Django Production Backend
+After=network.target
+
+[Service]
+Type=notify
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/freshdash-backend
+EnvironmentFile=/var/www/freshdash-backend/.env
+ExecStart=/var/www/freshdash-backend/.venv/bin/gunicorn config.wsgi:application --config gunicorn.conf.py
+ExecReload=/bin/kill -s HUP $MAINPID
+KillMode=mixed
+TimeoutStopSec=15
+PrivateTmp=true
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+

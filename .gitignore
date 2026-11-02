@@ -12,16 +12,28 @@ env/
 .env
 .env.local
 
-# SQLite Database
+# SQLite Database & Backups
 *.sqlite3
 db.sqlite3
+db.sqlite3-wal
+db.sqlite3-shm
+backups/
 
-# IDE
+# Static & Uploaded Media Files
+staticfiles/
+media/
+
+# Application Logs
+logs/
+*.log
+
+# IDE & OS Files
 .vscode/
 .idea/
+.DS_Store
+Thumbs.db
 
 # Testing
 .pytest_cache/
 .coverage
 htmlcov/
-
