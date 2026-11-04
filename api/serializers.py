@@ -1,10 +1,13 @@
 from decimal import Decimal
 import uuid
+from django.db import models, transaction
+from django.utils.text import slugify
 from django.contrib.auth.models import User
 from django.contrib.auth import authenticate
 from django.contrib.auth.password_validation import validate_password
 from rest_framework import serializers
 from rest_framework_simplejwt.tokens import RefreshToken, TokenError
+from drf_spectacular.utils import extend_schema_field
 from .models import (
     Category,
     Product,
@@ -170,7 +173,7 @@ class CategorySerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Category
-        fields = ['id', 'name', 'photo', 'tint', 'is_active', 'products_count', 'created_at', 'updated_at']
+        fields = ['id', 'name', 'photo', 'tint', 'image', 'is_active', 'products_count', 'created_at', 'updated_at']
         read_only_fields = ['created_at', 'updated_at']
 
     def get_products_count(self, obj) -> int:
@@ -180,6 +183,8 @@ class CategorySerializer(serializers.ModelSerializer):
 class ProductSerializer(serializers.ModelSerializer):
     category_name = serializers.CharField(source='category.name', read_only=True)
     discount_percentage = serializers.IntegerField(read_only=True)
+    is_low_stock = serializers.BooleanField(read_only=True)
+    is_out_of_stock = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = Product
@@ -196,7 +201,11 @@ class ProductSerializer(serializers.ModelSerializer):
             'popular',
             'organic',
             'description',
+            'stock',
+            'image',
             'is_available',
+            'is_low_stock',
+            'is_out_of_stock',
             'created_at',
             'updated_at',
         ]
@@ -380,6 +389,8 @@ class OrderSerializer(serializers.ModelSerializer):
             'id',
             'order_number',
             'status',
+            'payment_method',
+            'payment_status',
             'delivery_address',
             'delivery_address_snapshot',
             'item_total',
@@ -391,12 +402,13 @@ class OrderSerializer(serializers.ModelSerializer):
             'created_at',
             'updated_at',
         ]
-        read_only_fields = ['id', 'order_number', 'status', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'order_number', 'status', 'payment_status', 'created_at', 'updated_at']
 
 
 class OrderCreateSerializer(serializers.Serializer):
     delivery_address_id = serializers.IntegerField(required=False, allow_null=True)
     coupon_code = serializers.CharField(required=False, allow_blank=True, max_length=30)
+    payment_method = serializers.ChoiceField(choices=Order.PAYMENT_METHOD_CHOICES, default='COD', required=False)
 
     def validate_delivery_address_id(self, value):
         if value:
@@ -405,15 +417,33 @@ class OrderCreateSerializer(serializers.Serializer):
                 raise serializers.ValidationError("Delivery address does not exist or does not belong to you.")
         return value
 
+    @transaction.atomic
     def create(self, validated_data):
         user = self.context['request'].user
         address_id = validated_data.get('delivery_address_id')
         coupon_code = validated_data.get('coupon_code', '').strip().upper()
+        payment_method = validated_data.get('payment_method', 'COD')
 
         # Fetch user cart items
-        cart_items = CartItem.objects.filter(user=user).select_related('product')
-        if not cart_items.exists():
+        cart_items = list(CartItem.objects.filter(user=user).select_related('product'))
+        if not cart_items:
             raise serializers.ValidationError("Your basket is empty. Add products before placing an order.")
+
+        # Check stock availability for all products in cart
+        for item in cart_items:
+            needed = item.quantity * 2 if item.large else item.quantity
+            if not item.product.is_available or item.product.stock < needed:
+                raise serializers.ValidationError(
+                    f"Insufficient stock for '{item.product.name}'. Only {item.product.stock} available (requested {needed})."
+                )
+
+        # Deduct stock atomically
+        for item in cart_items:
+            needed = item.quantity * 2 if item.large else item.quantity
+            item.product.stock -= needed
+            if item.product.stock == 0:
+                item.product.is_available = False
+            item.product.save(update_fields=['stock', 'is_available'])
 
         # Resolve address
         address = None
@@ -449,6 +479,8 @@ class OrderCreateSerializer(serializers.Serializer):
             order_number=order_number,
             user=user,
             status='placed',
+            payment_method=payment_method,
+            payment_status='pending',
             delivery_address=address,
             delivery_address_snapshot=address_snapshot,
             item_total=item_total,
@@ -474,7 +506,7 @@ class OrderCreateSerializer(serializers.Serializer):
         OrderItem.objects.bulk_create(order_items)
 
         # Clear user cart after placing order
-        cart_items.delete()
+        CartItem.objects.filter(user=user).delete()
 
         return order
 
@@ -507,4 +539,363 @@ class FAQSerializer(serializers.ModelSerializer):
     class Meta:
         model = FAQ
         fields = ['id', 'question', 'answer', 'order']
+
+
+# -----------------------------------------------------------------------------
+# Admin Management System Serializers
+# -----------------------------------------------------------------------------
+
+class AdminLoginSerializer(serializers.Serializer):
+    """
+    Admin authentication with role verification.
+    Only allows access to users with staff, superuser, or admin/manager role.
+    """
+    username = serializers.CharField(help_text="Username or email address")
+    password = serializers.CharField(write_only=True)
+
+    def validate(self, attrs):
+        login_input = attrs.get('username', '').strip()
+        password = attrs.get('password')
+
+        if not login_input or not password:
+            raise serializers.ValidationError("Both username/email and password are required.")
+
+        auth_username = login_input
+        if '@' in login_input:
+            matched = User.objects.filter(email__iexact=login_input).first()
+            if matched:
+                auth_username = matched.username
+
+        user = authenticate(username=auth_username, password=password)
+        if not user:
+            raise serializers.ValidationError("Invalid username/email or password.")
+        if not user.is_active:
+            raise serializers.ValidationError("Account is disabled.")
+
+        is_admin = user.is_superuser or user.is_staff or (
+            hasattr(user, 'profile') and user.profile.role in ['admin', 'manager']
+        )
+        if not is_admin:
+            raise serializers.ValidationError("Access denied. Administrator privileges required.")
+
+        refresh = RefreshToken.for_user(user)
+        access = str(refresh.access_token)
+
+        attrs['user'] = user
+        attrs['tokens'] = {
+            'access': access,
+            'refresh': str(refresh),
+        }
+        return attrs
+
+
+class AdminUserSerializer(serializers.ModelSerializer):
+    """
+    Serializer for admin user profile responses.
+    """
+    role = serializers.CharField(source='profile.role', default='admin', read_only=True)
+    phone_number = serializers.CharField(source='profile.phone_number', default='', read_only=True)
+
+    class Meta:
+        model = User
+        fields = [
+            'id',
+            'username',
+            'email',
+            'first_name',
+            'last_name',
+            'role',
+            'is_staff',
+            'is_superuser',
+            'is_active',
+            'phone_number',
+            'date_joined',
+            'last_login',
+        ]
+        read_only_fields = fields
+
+
+class AdminCategorySerializer(serializers.ModelSerializer):
+    """
+    Category CRUD for administrators, with safe slug generation and product counters.
+    """
+    id = serializers.CharField(required=False, help_text="Slug ID (e.g. 'vegetables') or leave blank to auto-slugify")
+    products_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Category
+        fields = [
+            'id',
+            'name',
+            'photo',
+            'tint',
+            'image',
+            'is_active',
+            'products_count',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['created_at', 'updated_at']
+
+    def get_products_count(self, obj) -> int:
+        return obj.products.count()
+
+    def create(self, validated_data):
+        cat_id = validated_data.get('id')
+        if not cat_id:
+            base_slug = slugify(validated_data['name']) or 'cat'
+            slug = base_slug
+            counter = 1
+            while Category.objects.filter(id=slug).exists():
+                slug = f"{base_slug}-{counter}"
+                counter += 1
+            validated_data['id'] = slug
+        return super().create(validated_data)
+
+
+class AdminProductSerializer(serializers.ModelSerializer):
+    """
+    Product CRUD for administrators with full pricing, stock, image upload and availability control.
+    """
+    id = serializers.CharField(required=False, help_text="Product slug id (e.g. 'fresh-apples') or leave blank to auto-slugify")
+    category_name = serializers.CharField(source='category.name', read_only=True)
+    discount_percentage = serializers.IntegerField(read_only=True)
+    is_low_stock = serializers.BooleanField(read_only=True)
+    is_out_of_stock = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = Product
+        fields = [
+            'id',
+            'name',
+            'weight',
+            'price',
+            'original',
+            'discount_percentage',
+            'photo',
+            'category',
+            'category_name',
+            'popular',
+            'organic',
+            'description',
+            'stock',
+            'image',
+            'is_available',
+            'is_low_stock',
+            'is_out_of_stock',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['created_at', 'updated_at']
+
+    def validate_stock(self, value):
+        if value < 0:
+            raise serializers.ValidationError("Stock units cannot be negative.")
+        return value
+
+    def validate(self, attrs):
+        price = attrs.get('price', getattr(self.instance, 'price', None))
+        original = attrs.get('original', getattr(self.instance, 'original', None))
+
+        if price is not None and price < 0:
+            raise serializers.ValidationError({'price': "Price cannot be negative."})
+        if original is not None and original < 0:
+            raise serializers.ValidationError({'original': "Original price cannot be negative."})
+        if price is not None and original is not None and price > original:
+            raise serializers.ValidationError({'price': "Discounted price cannot exceed original price."})
+
+        return attrs
+
+    def create(self, validated_data):
+        prod_id = validated_data.get('id')
+        if not prod_id:
+            base_slug = slugify(validated_data['name']) or 'item'
+            slug = base_slug
+            counter = 1
+            while Product.objects.filter(id=slug).exists():
+                slug = f"{base_slug}-{counter}"
+                counter += 1
+            validated_data['id'] = slug
+        return super().create(validated_data)
+
+
+class AdminOrderItemSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = OrderItem
+        fields = [
+            'id',
+            'product',
+            'product_name',
+            'weight',
+            'quantity',
+            'large',
+            'unit_price',
+            'total_price',
+        ]
+
+
+class AdminOrderListSerializer(serializers.ModelSerializer):
+    """
+    Compact order summary for admin listings with customer overview.
+    """
+    customer_name = serializers.SerializerMethodField()
+    customer_email = serializers.CharField(source='user.email', read_only=True)
+    customer_username = serializers.CharField(source='user.username', read_only=True)
+    items_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Order
+        fields = [
+            'id',
+            'order_number',
+            'status',
+            'payment_method',
+            'payment_status',
+            'customer_username',
+            'customer_name',
+            'customer_email',
+            'items_count',
+            'item_total',
+            'delivery_fee',
+            'discount_amount',
+            'grand_total',
+            'coupon_code',
+            'created_at',
+            'updated_at',
+        ]
+
+    def get_customer_name(self, obj) -> str:
+        name = f"{obj.user.first_name} {obj.user.last_name}".strip()
+        return name or obj.user.username
+
+    def get_items_count(self, obj) -> int:
+        return obj.items.count()
+
+
+class AdminOrderDetailSerializer(serializers.ModelSerializer):
+    """
+    Comprehensive order details for admin inspection.
+    """
+    customer = serializers.SerializerMethodField()
+    items = AdminOrderItemSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Order
+        fields = [
+            'id',
+            'order_number',
+            'status',
+            'payment_method',
+            'payment_status',
+            'customer',
+            'delivery_address',
+            'delivery_address_snapshot',
+            'items',
+            'item_total',
+            'delivery_fee',
+            'discount_amount',
+            'grand_total',
+            'coupon_code',
+            'created_at',
+            'updated_at',
+        ]
+
+    def get_customer(self, obj) -> dict:
+        return {
+            'id': obj.user.id,
+            'username': obj.user.username,
+            'email': obj.user.email,
+            'full_name': f"{obj.user.first_name} {obj.user.last_name}".strip() or obj.user.username,
+            'phone_number': getattr(obj.user.profile, 'phone_number', '') if hasattr(obj.user, 'profile') else '',
+        }
+
+
+class AdminOrderStatusUpdateSerializer(serializers.Serializer):
+    """
+    Admin updating order status, payment status, and payment method.
+    """
+    status = serializers.ChoiceField(choices=Order.STATUS_CHOICES, required=False)
+    payment_status = serializers.ChoiceField(choices=Order.PAYMENT_STATUS_CHOICES, required=False)
+    payment_method = serializers.ChoiceField(choices=Order.PAYMENT_METHOD_CHOICES, required=False)
+
+    def validate(self, attrs):
+        if not attrs:
+            raise serializers.ValidationError("At least one field (status, payment_status, payment_method) is required.")
+        return attrs
+
+
+class AdminCustomerSerializer(serializers.ModelSerializer):
+    """
+    Registered customer listing with metrics for admin dashboard.
+    """
+    role = serializers.CharField(source='profile.role', default='customer', read_only=True)
+    phone_number = serializers.CharField(source='profile.phone_number', default='', read_only=True)
+    orders_count = serializers.SerializerMethodField()
+    total_spent = serializers.SerializerMethodField()
+
+    class Meta:
+        model = User
+        fields = [
+            'id',
+            'username',
+            'email',
+            'first_name',
+            'last_name',
+            'phone_number',
+            'role',
+            'is_active',
+            'is_staff',
+            'orders_count',
+            'total_spent',
+            'date_joined',
+            'last_login',
+        ]
+
+    def get_orders_count(self, obj) -> int:
+        return obj.orders.count()
+
+    def get_total_spent(self, obj) -> Decimal:
+        spent = obj.orders.exclude(status='cancelled').aggregate(total=models.Sum('grand_total'))['total']
+        return spent or Decimal('0.00')
+
+
+class AdminCustomerDetailSerializer(AdminCustomerSerializer):
+    """
+    Detailed customer inspection with addresses and recent orders.
+    """
+    addresses = AddressSerializer(many=True, read_only=True)
+    recent_orders = serializers.SerializerMethodField()
+
+    class Meta(AdminCustomerSerializer.Meta):
+        fields = AdminCustomerSerializer.Meta.fields + ['addresses', 'recent_orders']
+
+    @extend_schema_field(AdminOrderListSerializer(many=True))
+    def get_recent_orders(self, obj):
+        orders = obj.orders.all()[:10]
+        return AdminOrderListSerializer(orders, many=True).data
+
+
+class AdminInventoryStockAdjustSerializer(serializers.Serializer):
+    """
+    Single product stock adjustment.
+    """
+    product_id = serializers.CharField()
+    stock = serializers.IntegerField(min_value=0, required=False)
+    adjustment = serializers.IntegerField(required=False, help_text="Delta to add or subtract (e.g. +10, -5)")
+
+    def validate(self, attrs):
+        if 'stock' not in attrs and 'adjustment' not in attrs:
+            raise serializers.ValidationError("Either 'stock' or 'adjustment' must be provided.")
+        prod_id = attrs.get('product_id')
+        if not Product.objects.filter(id=prod_id).exists():
+            raise serializers.ValidationError(f"Product with id '{prod_id}' does not exist.")
+        return attrs
+
+
+class AdminBatchStockAdjustSerializer(serializers.Serializer):
+    """
+    Batch stock adjustment payload.
+    """
+    adjustments = AdminInventoryStockAdjustSerializer(many=True)
+
 

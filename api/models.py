@@ -14,6 +14,7 @@ class Category(models.Model):
     name = models.CharField(max_length=100)
     photo = models.PositiveIntegerField(default=0, help_text="Atlas photo index for frontend produce photo")
     tint = models.CharField(max_length=20, default="#EEF4E8", help_text="Hex code tint for mobile card background")
+    image = models.ImageField(upload_to='categories/', null=True, blank=True, help_text="Uploaded category banner or icon")
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -41,6 +42,8 @@ class Product(models.Model):
     popular = models.BooleanField(default=False, help_text="Flag for everyday bestsellers")
     organic = models.BooleanField(default=False, help_text="Flag for certified organic produce")
     description = models.TextField(blank=True)
+    stock = models.PositiveIntegerField(default=50, validators=[MinValueValidator(0)], help_text="Available inventory units")
+    image = models.ImageField(upload_to='products/', null=True, blank=True, help_text="Uploaded product photo")
     is_available = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -58,6 +61,14 @@ class Product(models.Model):
         if self.original and self.original > self.price:
             return round(100 * (1 - float(self.price) / float(self.original)))
         return 0
+
+    @property
+    def is_low_stock(self) -> bool:
+        return 0 < self.stock <= 10
+
+    @property
+    def is_out_of_stock(self) -> bool:
+        return self.stock == 0 or not self.is_available
 
 
 class Address(models.Model):
@@ -173,16 +184,36 @@ class Order(models.Model):
     Customer orders placed via FreshDash.
     """
     STATUS_CHOICES = [
+        ('pending', 'Pending'),
         ('placed', 'Placed'),
         ('confirmed', 'Confirmed'),
+        ('processing', 'Processing'),
+        ('shipped', 'Shipped'),
         ('out_for_delivery', 'Out for Delivery'),
         ('delivered', 'Delivered'),
         ('cancelled', 'Cancelled'),
     ]
 
+    PAYMENT_METHOD_CHOICES = [
+        ('COD', 'Cash on Delivery'),
+        ('UPI', 'UPI Payment'),
+        ('Card', 'Credit/Debit Card'),
+        ('NetBanking', 'Net Banking'),
+        ('Wallet', 'Digital Wallet'),
+    ]
+
+    PAYMENT_STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('paid', 'Paid'),
+        ('failed', 'Failed'),
+        ('refunded', 'Refunded'),
+    ]
+
     order_number = models.CharField(max_length=32, unique=True)
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="orders")
     status = models.CharField(max_length=30, choices=STATUS_CHOICES, default='placed')
+    payment_method = models.CharField(max_length=30, choices=PAYMENT_METHOD_CHOICES, default='COD')
+    payment_status = models.CharField(max_length=30, choices=PAYMENT_STATUS_CHOICES, default='pending')
     delivery_address = models.ForeignKey(Address, on_delete=models.SET_NULL, null=True, blank=True, related_name="orders")
     delivery_address_snapshot = models.JSONField(default=dict, blank=True)
     item_total = models.DecimalField(max_digits=10, decimal_places=2)
@@ -267,7 +298,14 @@ class UserProfile(models.Model):
     """
     Mobile user settings and profile metadata.
     """
+    ROLE_CHOICES = [
+        ('admin', 'Admin'),
+        ('manager', 'Manager'),
+        ('customer', 'Customer'),
+    ]
+
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="profile")
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='customer')
     phone_number = models.CharField(max_length=20, blank=True)
     order_updates = models.BooleanField(default=True)
     offers_notifications = models.BooleanField(default=False)
@@ -279,13 +317,18 @@ class UserProfile(models.Model):
         verbose_name_plural = "User Profiles"
 
     def __str__(self):
-        return f"Profile of {self.user.username}"
+        return f"Profile of {self.user.username} ({self.role})"
 
 
 @receiver(post_save, sender=User)
 def create_or_update_user_profile(sender, instance, created, **kwargs):
     if created:
-        UserProfile.objects.create(user=instance)
+        role = 'admin' if (instance.is_staff or instance.is_superuser) else 'customer'
+        UserProfile.objects.create(user=instance, role=role)
     else:
         if hasattr(instance, 'profile'):
-            instance.profile.save()
+            if (instance.is_staff or instance.is_superuser) and instance.profile.role == 'customer':
+                instance.profile.role = 'admin'
+                instance.profile.save()
+            else:
+                instance.profile.save()

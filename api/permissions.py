@@ -21,3 +21,22 @@ class IsAdminOrReadOnly(permissions.BasePermission):
             return True
         return bool(request.user and request.user.is_staff)
 
+
+class IsAdminRole(permissions.BasePermission):
+    """
+    Allows access only to authenticated administrative staff (admins or managers).
+    Normal customers are strictly forbidden (HTTP 403).
+    """
+    message = "Access denied. Administrator privileges required."
+
+    def has_permission(self, request, view):
+        user = request.user
+        if not (user and user.is_authenticated):
+            return False
+        if user.is_superuser or user.is_staff:
+            return True
+        if hasattr(user, 'profile') and user.profile.role in ['admin', 'manager']:
+            return True
+        return False
+
+

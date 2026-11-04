@@ -1,7 +1,10 @@
 from decimal import Decimal
 from datetime import timedelta
+from io import BytesIO
 import time
+from PIL import Image
 from django.contrib.auth.models import User
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.cache import cache
 from rest_framework import status
 from rest_framework.test import APITestCase, APIClient
@@ -926,3 +929,511 @@ class FreshDashAPITestCase(APITestCase):
         # Check top-level access / refresh for standard Axios interceptors
         self.assertIn('access', res.data)
         self.assertIn('refresh', res.data)
+
+
+# -----------------------------------------------------------------------------
+# Admin Management System Automated Tests
+# -----------------------------------------------------------------------------
+
+class AdminManagementSystemAPITests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient()
+
+        # Regular Customer
+        self.customer = User.objects.create_user(
+            username='charlie',
+            password='CustomerPassword123!',
+            email='charlie@freshdash.local',
+            first_name='Charlie',
+            last_name='Customer'
+        )
+        self.customer_refresh = RefreshToken.for_user(self.customer)
+        self.customer_access = str(self.customer_refresh.access_token)
+
+        # Admin User (Superuser + role admin)
+        self.admin = User.objects.create_superuser(
+            username='admin_boss',
+            password='AdminPassword123!',
+            email='admin@freshdash.local',
+            first_name='Admin',
+            last_name='Boss'
+        )
+        if hasattr(self.admin, 'profile'):
+            self.admin.profile.role = 'admin'
+            self.admin.profile.save()
+        self.admin_refresh = RefreshToken.for_user(self.admin)
+        self.admin_access = str(self.admin_refresh.access_token)
+
+        # Manager User (Staff + role manager)
+        self.manager = User.objects.create_user(
+            username='manager_mary',
+            password='ManagerPassword123!',
+            email='mary@freshdash.local',
+            first_name='Mary',
+            last_name='Manager',
+            is_staff=True
+        )
+        if hasattr(self.manager, 'profile'):
+            self.manager.profile.role = 'manager'
+            self.manager.profile.save()
+        self.manager_refresh = RefreshToken.for_user(self.manager)
+        self.manager_access = str(self.manager_refresh.access_token)
+
+        # Categories
+        self.category_veg = Category.objects.create(
+            id='vegetables',
+            name='Vegetables',
+            photo=0,
+            tint='#EEF4E8'
+        )
+        self.category_empty = Category.objects.create(
+            id='dairy',
+            name='Dairy & Eggs',
+            photo=2,
+            tint='#FFF9E6'
+        )
+
+        # Products
+        self.product_spinach = Product.objects.create(
+            id='spinach',
+            name='Fresh Organic Spinach',
+            weight='250 g',
+            price=Decimal('25.00'),
+            original=Decimal('30.00'),
+            stock=50,
+            photo=3,
+            category=self.category_veg,
+            popular=True,
+            organic=True,
+            description='Leafy fresh spinach'
+        )
+        self.product_carrot = Product.objects.create(
+            id='carrot',
+            name='Sweet Carrots',
+            weight='500 g',
+            price=Decimal('40.00'),
+            original=Decimal('50.00'),
+            stock=8,  # low stock <= 10
+            photo=4,
+            category=self.category_veg,
+            popular=False,
+            organic=False,
+            description='Crunchy orange carrots'
+        )
+        self.product_mango = Product.objects.create(
+            id='mango',
+            name='Alphonso Mangoes',
+            weight='1 kg',
+            price=Decimal('200.00'),
+            original=Decimal('250.00'),
+            stock=0,  # out of stock
+            is_available=False,
+            photo=5,
+            category=self.category_veg,
+            popular=True,
+            organic=True,
+            description='Sweet Alphonso mangoes'
+        )
+
+        # Customer Address
+        self.address = Address.objects.create(
+            user=self.customer,
+            name='Home',
+            line='123 Green Avenue',
+            area='Downtown, Mumbai',
+            is_default=True
+        )
+
+    # 1. Admin Authentication & RBAC Tests
+    def test_admin_login_success(self):
+        res = self.client.post('/api/v1/admin/auth/login/', {
+            'username': 'admin_boss',
+            'password': 'AdminPassword123!',
+        })
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertTrue(res.data['success'])
+        self.assertIn('tokens', res.data)
+        self.assertIn('access', res.data['tokens'])
+        self.assertIn('refresh', res.data['tokens'])
+        self.assertEqual(res.data['user']['username'], 'admin_boss')
+        self.assertEqual(res.data['user']['role'], 'admin')
+
+    def test_manager_login_success(self):
+        res = self.client.post('/api/v1/admin/auth/login/', {
+            'username': 'manager_mary',
+            'password': 'ManagerPassword123!',
+        })
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertTrue(res.data['success'])
+        self.assertEqual(res.data['user']['role'], 'manager')
+
+    def test_customer_login_to_admin_denied_with_403(self):
+        res = self.client.post('/api/v1/admin/auth/login/', {
+            'username': 'charlie',
+            'password': 'CustomerPassword123!',
+        })
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn('Access denied', str(res.data))
+
+    def test_admin_login_invalid_password(self):
+        res = self.client.post('/api/v1/admin/auth/login/', {
+            'username': 'admin_boss',
+            'password': 'WrongPassword!',
+        })
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_admin_me_profile(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        res = self.client.get('/api/v1/admin/auth/me/')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data['user']['username'], 'admin_boss')
+
+    def test_unauthenticated_request_rejected(self):
+        res = self.client.get('/api/v1/admin/products/')
+        self.assertEqual(res.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_customer_token_forbidden_on_admin_endpoint(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.customer_access}')
+        res = self.client.get('/api/v1/admin/products/')
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    # 2. Product Management Tests
+    def test_admin_list_products(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        res = self.client.get('/api/v1/admin/products/')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        items = res.data.get('results', res.data) if isinstance(res.data, dict) else res.data
+        self.assertGreaterEqual(len(items), 3)
+
+    def test_admin_create_product(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        payload = {
+            'id': 'bell-pepper',
+            'name': 'Green Bell Pepper',
+            'weight': '500 g',
+            'price': '45.00',
+            'original': '60.00',
+            'stock': 30,
+            'category': 'vegetables',
+            'popular': False,
+            'organic': True,
+            'description': 'Crisp organic bell peppers',
+        }
+        res = self.client.post('/api/v1/admin/products/', payload)
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res.data['id'], 'bell-pepper')
+        self.assertEqual(res.data['stock'], 30)
+        self.assertTrue(Product.objects.filter(id='bell-pepper').exists())
+
+    def test_admin_create_product_auto_slug(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        payload = {
+            'name': 'Fresh Broccoli Florets',
+            'weight': '250 g',
+            'price': '65.00',
+            'original': '80.00',
+            'stock': 20,
+            'category': 'vegetables',
+        }
+        res = self.client.post('/api/v1/admin/products/', payload)
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(res.data['id'].startswith('fresh-broccoli'))
+
+    def test_admin_update_product(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        res = self.client.patch('/api/v1/admin/products/spinach/', {
+            'price': '22.00',
+            'stock': 45,
+            'description': 'Updated crisp spinach description',
+        })
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.spinach = Product.objects.get(id='spinach')
+        self.assertEqual(self.spinach.price, Decimal('22.00'))
+        self.assertEqual(self.spinach.stock, 45)
+
+    def test_admin_toggle_product_status(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        res = self.client.post('/api/v1/admin/products/spinach/toggle-status/')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertFalse(res.data['is_available'])
+        # Toggle back
+        res2 = self.client.post('/api/v1/admin/products/spinach/toggle-status/')
+        self.assertEqual(res2.status_code, status.HTTP_200_OK)
+        self.assertTrue(res2.data['is_available'])
+
+    def test_admin_adjust_product_stock(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        # Set absolute
+        res = self.client.post('/api/v1/admin/products/spinach/adjust-stock/', {'stock': 100})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data['product']['stock'], 100)
+
+        # Delta adjustment (+25)
+        res2 = self.client.post('/api/v1/admin/products/spinach/adjust-stock/', {'adjustment': 25})
+        self.assertEqual(res2.status_code, status.HTTP_200_OK)
+        self.assertEqual(res2.data['product']['stock'], 125)
+
+    def test_admin_delete_product(self):
+        prod = Product.objects.create(
+            id='temp-product',
+            name='Temporary Fruit',
+            weight='1 kg',
+            price=Decimal('10.00'),
+            original=Decimal('15.00'),
+            category=self.category_veg
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        res = self.client.delete(f'/api/v1/admin/products/{prod.id}/')
+        self.assertEqual(res.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(Product.objects.filter(id='temp-product').exists())
+
+    # 3. Category Management Tests
+    def test_admin_list_categories(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        res = self.client.get('/api/v1/admin/categories/')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        categories = res.data.get('results', res.data) if isinstance(res.data, dict) else res.data
+        self.assertGreaterEqual(len(categories), 2)
+        veg_cat = next(c for c in categories if c['id'] == 'vegetables')
+        self.assertGreaterEqual(veg_cat['products_count'], 1)
+
+    def test_admin_create_category(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        payload = {
+            'name': 'Exotic Fruits',
+            'tint': '#FFE4E1',
+            'photo': 7,
+        }
+        res = self.client.post('/api/v1/admin/categories/', payload)
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(res.data['id'].startswith('exotic-fruits'))
+
+    def test_admin_safe_category_deletion(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        # Deleting category with products fails with 400
+        res = self.client.delete('/api/v1/admin/categories/vegetables/')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Cannot delete category', res.data['message'])
+
+        # Deleting empty category succeeds
+        res_empty = self.client.delete('/api/v1/admin/categories/dairy/')
+        self.assertEqual(res_empty.status_code, status.HTTP_200_OK)
+        self.assertFalse(Category.objects.filter(id='dairy').exists())
+
+    def test_admin_toggle_category_status(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        res = self.client.post('/api/v1/admin/categories/vegetables/toggle-status/')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertFalse(res.data['is_active'])
+
+    # 4. Order Management & Stock Restoration Tests
+    def test_admin_list_orders_and_detail(self):
+        # Create an order
+        order = Order.objects.create(
+            order_number='TESTORD101',
+            user=self.customer,
+            status='placed',
+            item_total=Decimal('50.00'),
+            delivery_fee=Decimal('20.00'),
+            discount_amount=Decimal('0.00'),
+            grand_total=Decimal('70.00'),
+            payment_method='COD',
+            payment_status='pending',
+            delivery_address=self.address,
+            delivery_address_snapshot={'name': 'Home', 'line': '123 Green Ave', 'area': 'Downtown'}
+        )
+        OrderItem.objects.create(
+            order=order,
+            product=self.product_spinach,
+            product_name=self.product_spinach.name,
+            weight=self.product_spinach.weight,
+            quantity=2,
+            unit_price=Decimal('25.00'),
+            total_price=Decimal('50.00')
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        res_list = self.client.get('/api/v1/admin/orders/')
+        self.assertEqual(res_list.status_code, status.HTTP_200_OK)
+        orders = res_list.data.get('results', res_list.data) if isinstance(res_list.data, dict) else res_list.data
+        self.assertGreaterEqual(len(orders), 1)
+
+        res_detail = self.client.get(f'/api/v1/admin/orders/{order.order_number}/')
+        self.assertEqual(res_detail.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_detail.data['order_number'], 'TESTORD101')
+        self.assertEqual(res_detail.data['customer']['username'], 'charlie')
+        self.assertEqual(len(res_detail.data['items']), 1)
+
+    def test_admin_update_order_status_and_payment(self):
+        order = Order.objects.create(
+            order_number='TESTORD102',
+            user=self.customer,
+            status='placed',
+            item_total=Decimal('100.00'),
+            grand_total=Decimal('100.00'),
+            payment_method='UPI',
+            payment_status='pending'
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        res = self.client.post(f'/api/v1/admin/orders/{order.order_number}/update-status/', {
+            'status': 'processing',
+            'payment_status': 'paid',
+        })
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        order.refresh_from_db()
+        self.assertEqual(order.status, 'processing')
+        self.assertEqual(order.payment_status, 'paid')
+
+    def test_admin_order_cancellation_restores_stock(self):
+        # Product initial stock = 50
+        initial_stock = self.product_spinach.stock
+        order = Order.objects.create(
+            order_number='TESTORD103',
+            user=self.customer,
+            status='placed',
+            item_total=Decimal('75.00'),
+            grand_total=Decimal('75.00')
+        )
+        OrderItem.objects.create(
+            order=order,
+            product=self.product_spinach,
+            product_name=self.product_spinach.name,
+            weight=self.product_spinach.weight,
+            quantity=3,
+            unit_price=Decimal('25.00'),
+            total_price=Decimal('75.00')
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        res = self.client.post(f'/api/v1/admin/orders/{order.order_number}/update-status/', {
+            'status': 'cancelled'
+        })
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.product_spinach.refresh_from_db()
+        self.assertEqual(self.product_spinach.stock, initial_stock + 3)
+
+    # 5. Customer Management Tests
+    def test_admin_list_customers(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        res = self.client.get('/api/v1/admin/customers/')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        customers = res.data.get('results', res.data) if isinstance(res.data, dict) else res.data
+        charlie_entry = next((c for c in customers if c['username'] == 'charlie'), None)
+        self.assertIsNotNone(charlie_entry)
+        self.assertIn('orders_count', charlie_entry)
+        self.assertIn('total_spent', charlie_entry)
+
+    def test_admin_customer_detail(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        res = self.client.get(f'/api/v1/admin/customers/{self.customer.id}/')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data['username'], 'charlie')
+        self.assertEqual(len(res.data['addresses']), 1)
+
+    def test_admin_toggle_customer_status(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        res = self.client.post(f'/api/v1/admin/customers/{self.customer.id}/toggle-status/')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.customer.refresh_from_db()
+        self.assertFalse(self.customer.is_active)
+
+    def test_admin_change_customer_role(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        res = self.client.post(f'/api/v1/admin/customers/{self.customer.id}/change-role/', {
+            'role': 'manager'
+        })
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.customer.refresh_from_db()
+        self.assertEqual(self.customer.profile.role, 'manager')
+        self.assertTrue(self.customer.is_staff)
+
+    # 6. Inventory & Stock Detection Tests
+    def test_inventory_list_and_filters(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        # Low stock filter
+        res_low = self.client.get('/api/v1/admin/inventory/?filter=low_stock')
+        self.assertEqual(res_low.status_code, status.HTTP_200_OK)
+        self.assertTrue(any(p['id'] == 'carrot' for p in res_low.data['inventory']))
+
+        # Out of stock filter
+        res_out = self.client.get('/api/v1/admin/inventory/?filter=out_of_stock')
+        self.assertEqual(res_out.status_code, status.HTTP_200_OK)
+        self.assertTrue(any(p['id'] == 'mango' for p in res_out.data['inventory']))
+
+    def test_inventory_batch_adjust(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        payload = {
+            'adjustments': [
+                {'product_id': 'spinach', 'stock': 80},
+                {'product_id': 'carrot', 'stock': 25},
+            ]
+        }
+        res = self.client.post('/api/v1/admin/inventory/batch-adjust/', payload, format='json')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data['updated_count'], 2)
+        self.product_spinach.refresh_from_db()
+        self.product_carrot.refresh_from_db()
+        self.assertEqual(self.product_spinach.stock, 80)
+        self.assertEqual(self.product_carrot.stock, 25)
+
+    # 7. Customer Order Placement Decrements Stock Atomically
+    def test_customer_order_decrements_stock(self):
+        initial_stock = self.product_spinach.stock
+        # Add to cart
+        CartItem.objects.create(
+            user=self.customer,
+            product=self.product_spinach,
+            quantity=2,
+            large=False
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.customer_access}')
+        res = self.client.post('/api/v1/orders/', {
+            'delivery_address_id': self.address.id
+        })
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.product_spinach.refresh_from_db()
+        self.assertEqual(self.product_spinach.stock, initial_stock - 2)
+
+    def test_customer_order_insufficient_stock_fails(self):
+        # Product carrot has stock = 8
+        CartItem.objects.create(
+            user=self.customer,
+            product=self.product_carrot,
+            quantity=10,  # exceeds available 8
+            large=False
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.customer_access}')
+        res = self.client.post('/api/v1/orders/', {
+            'delivery_address_id': self.address.id
+        })
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Insufficient stock', str(res.data))
+
+    # 8. Real-Time Admin Dashboard Analytics Tests
+    def test_admin_dashboard_metrics(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        res = self.client.get('/api/v1/admin/dashboard/')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertTrue(res.data['success'])
+        analytics = res.data['analytics']
+
+        # Assert key live metrics exist and match real counts
+        self.assertIn('total_products', analytics)
+        self.assertIn('active_products', analytics)
+        self.assertIn('total_categories', analytics)
+        self.assertIn('total_customers', analytics)
+        self.assertIn('total_orders', analytics)
+        self.assertIn('today_orders_count', analytics)
+        self.assertIn('today_revenue', analytics)
+        self.assertIn('total_revenue', analytics)
+        self.assertIn('orders_by_status', analytics)
+        self.assertIn('recent_orders', analytics)
+        self.assertIn('best_selling_products', analytics)
+        self.assertIn('low_stock_products', analytics)
+        self.assertIn('out_of_stock_products', analytics)
+        self.assertEqual(analytics['total_categories'], Category.objects.count())
+        self.assertEqual(analytics['total_products'], Product.objects.count())
+

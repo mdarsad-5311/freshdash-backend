@@ -1,10 +1,13 @@
 from decimal import Decimal
 from django.shortcuts import get_object_or_404
-from django.db.models import Prefetch
+from django.db import transaction
+from django.db.models import Prefetch, Sum, Count, Q
+from django.utils import timezone
 from rest_framework import viewsets, status, permissions
 from rest_framework.views import APIView
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.authtoken.models import Token
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenRefreshView as BaseTokenRefreshView
@@ -21,6 +24,7 @@ from .models import (
     FavoriteProduct,
     FAQ,
     UserProfile,
+    User,
 )
 from .serializers import (
     UserSerializer,
@@ -42,8 +46,20 @@ from .serializers import (
     FAQSerializer,
     FREE_DELIVERY_THRESHOLD,
     STANDARD_DELIVERY_FEE,
+    AdminLoginSerializer,
+    AdminUserSerializer,
+    AdminCategorySerializer,
+    AdminProductSerializer,
+    AdminOrderItemSerializer,
+    AdminOrderListSerializer,
+    AdminOrderDetailSerializer,
+    AdminOrderStatusUpdateSerializer,
+    AdminCustomerSerializer,
+    AdminCustomerDetailSerializer,
+    AdminInventoryStockAdjustSerializer,
+    AdminBatchStockAdjustSerializer,
 )
-from .permissions import IsOwner, IsAdminOrReadOnly
+from .permissions import IsOwner, IsAdminOrReadOnly, IsAdminRole
 from .filters import ProductFilter
 
 
@@ -578,8 +594,19 @@ class OrderViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        order.status = 'cancelled'
-        order.save()
+        with transaction.atomic():
+            order.status = 'cancelled'
+            order.save(update_fields=['status', 'updated_at'])
+
+            # Restore product inventory
+            for item in order.items.select_related('product'):
+                if item.product:
+                    restored = item.quantity * 2 if item.large else item.quantity
+                    item.product.stock += restored
+                    if item.product.stock > 0 and not item.product.is_available:
+                        item.product.is_available = True
+                    item.product.save(update_fields=['stock', 'is_available'])
+
         return Response(
             {
                 "success": True,
@@ -695,3 +722,710 @@ class FAQViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = FAQ.objects.filter(is_active=True).order_by('order', 'id')
     serializer_class = FAQSerializer
     permission_classes = [permissions.AllowAny]
+
+
+# -----------------------------------------------------------------------------
+# Admin Management System Views
+# -----------------------------------------------------------------------------
+
+class AdminLoginView(APIView):
+    """
+    Dedicated admin login endpoint.
+    Restricts access strictly to administrative roles (admin, manager, staff, superuser).
+    Regular customer accounts are denied access with HTTP 403 Forbidden.
+    """
+    permission_classes = [permissions.AllowAny]
+    serializer_class = AdminLoginSerializer
+    throttle_scope = 'login'
+
+    @extend_schema(request=AdminLoginSerializer, responses={200: OpenApiResponse(description="Admin JWT tokens and profile")})
+    def post(self, request):
+        serializer = AdminLoginSerializer(data=request.data)
+        if not serializer.is_valid():
+            # If role check failed, return 403 Forbidden
+            for err_list in serializer.errors.values():
+                if any("Access denied" in str(e) for e in err_list):
+                    return Response(
+                        {
+                            "success": False,
+                            "message": "Access denied. Administrator privileges required.",
+                            "detail": "Access denied. Administrator privileges required.",
+                        },
+                        status=status.HTTP_403_FORBIDDEN,
+                    )
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        user = serializer.validated_data['user']
+        tokens = serializer.validated_data['tokens']
+        token, _ = Token.objects.get_or_create(user=user)
+
+        return Response(
+            {
+                "success": True,
+                "message": "Admin authentication successful.",
+                "tokens": tokens,
+                "token": token.key,
+                "user": AdminUserSerializer(user).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class AdminMeView(APIView):
+    """
+    Retrieve and update the authenticated administrator's profile.
+    """
+    permission_classes = [IsAdminRole]
+
+    @extend_schema(responses={200: AdminUserSerializer})
+    def get(self, request):
+        return Response(
+            {
+                "success": True,
+                "user": AdminUserSerializer(request.user).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @extend_schema(request=AdminUserSerializer, responses={200: AdminUserSerializer})
+    def patch(self, request):
+        user = request.user
+        for field in ['first_name', 'last_name', 'email']:
+            if field in request.data:
+                setattr(user, field, request.data[field])
+        user.save()
+
+        if hasattr(user, 'profile') and 'phone_number' in request.data:
+            user.profile.phone_number = request.data['phone_number']
+            user.profile.save()
+
+        return Response(
+            {
+                "success": True,
+                "message": "Admin profile updated successfully.",
+                "user": AdminUserSerializer(user).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class AdminLogoutView(APIView):
+    """
+    Revoke admin refresh token and log out.
+    """
+    permission_classes = [IsAdminRole]
+
+    @extend_schema(request=LogoutSerializer, responses={200: OpenApiResponse(description="Logged out")})
+    def post(self, request):
+        serializer = LogoutSerializer(data=request.data, context={'request': request})
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(
+            {
+                "success": True,
+                "message": "Admin logged out successfully.",
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class AdminCategoryViewSet(viewsets.ModelViewSet):
+    """
+    Category Management for administrators:
+    Full CRUD, safe deletion protection, image uploads, and active status toggle.
+    """
+    permission_classes = [IsAdminRole]
+    queryset = Category.objects.all().order_by('name')
+    serializer_class = AdminCategorySerializer
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def destroy(self, request, *args, **kwargs):
+        category = self.get_object()
+        product_count = category.products.count()
+        if product_count > 0:
+            return Response(
+                {
+                    "success": False,
+                    "message": f"Cannot delete category '{category.name}' because it contains {product_count} product(s). Please reassign or delete these products first.",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        category_name = category.name
+        category.delete()
+        return Response(
+            {
+                "success": True,
+                "message": f"Category '{category_name}' deleted successfully.",
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=['post'], url_path='toggle-status')
+    def toggle_status(self, request, pk=None):
+        category = self.get_object()
+        category.is_active = not category.is_active
+        category.save(update_fields=['is_active', 'updated_at'])
+        return Response(
+            {
+                "success": True,
+                "is_active": category.is_active,
+                "message": f"Category '{category.name}' is now {'active' if category.is_active else 'inactive'}.",
+                "category": AdminCategorySerializer(category).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class AdminProductViewSet(viewsets.ModelViewSet):
+    """
+    Product Management for administrators:
+    Full CRUD, stock tracking, image upload, availability toggle, and stock adjustment.
+    """
+    permission_classes = [IsAdminRole]
+    queryset = Product.objects.select_related('category').all().order_by('-created_at')
+    serializer_class = AdminProductSerializer
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def get_queryset(self):
+        qs = Product.objects.select_related('category').all()
+
+        # Category filter
+        cat = self.request.query_params.get('category')
+        if cat:
+            qs = qs.filter(category_id=cat)
+
+        # Availability filter
+        avail = self.request.query_params.get('is_available')
+        if avail is not None:
+            if avail.lower() in ['true', '1']:
+                qs = qs.filter(is_available=True)
+            elif avail.lower() in ['false', '0']:
+                qs = qs.filter(is_available=False)
+
+        # Stock status filter
+        stock_status = self.request.query_params.get('stock_status')
+        if stock_status == 'low_stock':
+            qs = qs.filter(stock__gt=0, stock__lte=10)
+        elif stock_status == 'out_of_stock':
+            qs = qs.filter(Q(stock=0) | Q(is_available=False))
+        elif stock_status == 'in_stock':
+            qs = qs.filter(stock__gt=10, is_available=True)
+
+        # Search filter
+        search = self.request.query_params.get('search')
+        if search:
+            qs = qs.filter(
+                Q(name__icontains=search) |
+                Q(description__icontains=search) |
+                Q(id__icontains=search) |
+                Q(category__name__icontains=search)
+            )
+
+        # Ordering
+        ordering = self.request.query_params.get('ordering')
+        if ordering in ['price', '-price', 'stock', '-stock', 'name', '-name', 'created_at', '-created_at']:
+            qs = qs.order_by(ordering)
+        else:
+            qs = qs.order_by('-created_at')
+
+        return qs
+
+    @action(detail=True, methods=['post'], url_path='toggle-status')
+    def toggle_status(self, request, pk=None):
+        product = self.get_object()
+        product.is_available = not product.is_available
+        product.save(update_fields=['is_available', 'updated_at'])
+        return Response(
+            {
+                "success": True,
+                "is_available": product.is_available,
+                "message": f"Product '{product.name}' is now {'available' if product.is_available else 'unavailable'}.",
+                "product": AdminProductSerializer(product).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=['post'], url_path='adjust-stock')
+    def adjust_stock(self, request, pk=None):
+        product = self.get_object()
+        stock_val = request.data.get('stock')
+        adjustment = request.data.get('adjustment')
+
+        if stock_val is None and adjustment is None:
+            return Response(
+                {"success": False, "message": "Either 'stock' (absolute) or 'adjustment' (delta) is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            if stock_val is not None:
+                try:
+                    new_stock = int(stock_val)
+                    if new_stock < 0:
+                        raise ValueError()
+                except (ValueError, TypeError):
+                    return Response({"success": False, "message": "'stock' must be a non-negative integer."}, status=status.HTTP_400_BAD_REQUEST)
+                product.stock = new_stock
+            elif adjustment is not None:
+                try:
+                    delta = int(adjustment)
+                except (ValueError, TypeError):
+                    return Response({"success": False, "message": "'adjustment' must be an integer."}, status=status.HTTP_400_BAD_REQUEST)
+                if product.stock + delta < 0:
+                    return Response(
+                        {"success": False, "message": f"Cannot reduce stock below 0. Current stock: {product.stock}."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                product.stock += delta
+
+            if product.stock == 0:
+                product.is_available = False
+            elif product.stock > 0 and not product.is_available:
+                product.is_available = True
+
+            product.save(update_fields=['stock', 'is_available', 'updated_at'])
+
+        return Response(
+            {
+                "success": True,
+                "message": f"Stock for '{product.name}' updated to {product.stock}.",
+                "product": AdminProductSerializer(product).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class AdminOrderViewSet(viewsets.ModelViewSet):
+    """
+    Order Management for administrators:
+    List all customer orders, inspect details, update fulfillment and payment statuses,
+    with automatic inventory synchronization upon cancellation.
+    """
+    permission_classes = [IsAdminRole]
+    lookup_field = 'order_number'
+    queryset = Order.objects.select_related('user', 'user__profile', 'delivery_address').prefetch_related('items', 'items__product').all()
+
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return AdminOrderListSerializer
+        if self.action in ['update', 'partial_update']:
+            return AdminOrderStatusUpdateSerializer
+        return AdminOrderDetailSerializer
+
+    def get_object(self):
+        lookup_val = self.kwargs.get(self.lookup_field)
+        qs = self.get_queryset()
+        if lookup_val.isdigit():
+            obj = get_object_or_404(qs, id=int(lookup_val))
+        else:
+            obj = get_object_or_404(qs, order_number=lookup_val)
+        self.check_object_permissions(self.request, obj)
+        return obj
+
+    def get_queryset(self):
+        qs = Order.objects.select_related('user', 'user__profile', 'delivery_address').prefetch_related('items', 'items__product').all()
+
+        # Status filter
+        order_status = self.request.query_params.get('status')
+        if order_status:
+            qs = qs.filter(status=order_status)
+
+        # Payment status filter
+        payment_status = self.request.query_params.get('payment_status')
+        if payment_status:
+            qs = qs.filter(payment_status=payment_status)
+
+        # Payment method filter
+        payment_method = self.request.query_params.get('payment_method')
+        if payment_method:
+            qs = qs.filter(payment_method=payment_method)
+
+        # Search filter (order number, customer name, email)
+        search = self.request.query_params.get('search')
+        if search:
+            qs = qs.filter(
+                Q(order_number__icontains=search) |
+                Q(user__username__icontains=search) |
+                Q(user__email__icontains=search) |
+                Q(user__first_name__icontains=search) |
+                Q(user__last_name__icontains=search)
+            )
+
+        # Date range filters
+        date_from = self.request.query_params.get('date_from')
+        if date_from:
+            qs = qs.filter(created_at__date__gte=date_from)
+        date_to = self.request.query_params.get('date_to')
+        if date_to:
+            qs = qs.filter(created_at__date__lte=date_to)
+
+        return qs.order_by('-created_at')
+
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop('partial', False)
+        order = self.get_object()
+        serializer = AdminOrderStatusUpdateSerializer(data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        with transaction.atomic():
+            new_status = data.get('status')
+            if new_status and new_status != order.status:
+                old_status = order.status
+                order.status = new_status
+                # Restore stock on cancellation
+                if new_status == 'cancelled' and old_status != 'cancelled':
+                    for item in order.items.select_related('product'):
+                        if item.product:
+                            restored = item.quantity * 2 if item.large else item.quantity
+                            item.product.stock += restored
+                            if item.product.stock > 0 and not item.product.is_available:
+                                item.product.is_available = True
+                            item.product.save(update_fields=['stock', 'is_available'])
+
+            if 'payment_status' in data:
+                order.payment_status = data['payment_status']
+            if 'payment_method' in data:
+                order.payment_method = data['payment_method']
+
+            order.save()
+
+        return Response(
+            {
+                "success": True,
+                "message": f"Order #{order.order_number} updated successfully.",
+                "order": AdminOrderDetailSerializer(order).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=['post'], url_path='update-status')
+    def update_status(self, request, order_number=None):
+        return self.update(request, partial=True)
+
+
+class AdminCustomerViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    Customer Management for administrators:
+    Browse registered customers, view lifetime orders and total spend,
+    inspect address books and order histories, and toggle active/blocked account status.
+    """
+    permission_classes = [IsAdminRole]
+    queryset = User.objects.select_related('profile').prefetch_related('orders', 'addresses').all().order_by('-date_joined')
+
+    def get_serializer_class(self):
+        if self.action == 'retrieve':
+            return AdminCustomerDetailSerializer
+        return AdminCustomerSerializer
+
+    def get_queryset(self):
+        qs = User.objects.select_related('profile').prefetch_related('orders', 'addresses').all()
+
+        # Role filter
+        role = self.request.query_params.get('role')
+        if role:
+            qs = qs.filter(profile__role=role)
+
+        # Active filter
+        active = self.request.query_params.get('is_active')
+        if active is not None:
+            if active.lower() in ['true', '1']:
+                qs = qs.filter(is_active=True)
+            elif active.lower() in ['false', '0']:
+                qs = qs.filter(is_active=False)
+
+        # Search filter
+        search = self.request.query_params.get('search')
+        if search:
+            qs = qs.filter(
+                Q(username__icontains=search) |
+                Q(email__icontains=search) |
+                Q(first_name__icontains=search) |
+                Q(last_name__icontains=search) |
+                Q(profile__phone_number__icontains=search)
+            )
+
+        return qs.order_by('-date_joined')
+
+    @action(detail=True, methods=['post'], url_path='toggle-status')
+    def toggle_status(self, request, pk=None):
+        customer = self.get_object()
+        if customer == request.user:
+            return Response(
+                {"success": False, "message": "You cannot deactivate your own administrative account."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        customer.is_active = not customer.is_active
+        customer.save(update_fields=['is_active'])
+
+        return Response(
+            {
+                "success": True,
+                "is_active": customer.is_active,
+                "message": f"Customer '{customer.username}' account has been {'activated' if customer.is_active else 'deactivated/blocked'}.",
+                "customer": AdminCustomerSerializer(customer).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=['post'], url_path='change-role')
+    def change_role(self, request, pk=None):
+        customer = self.get_object()
+        new_role = request.data.get('role')
+        if new_role not in ['admin', 'manager', 'customer']:
+            return Response(
+                {"success": False, "message": "Role must be one of: 'admin', 'manager', 'customer'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not hasattr(customer, 'profile'):
+            UserProfile.objects.create(user=customer)
+
+        customer.profile.role = new_role
+        customer.profile.save(update_fields=['role'])
+
+        if new_role in ['admin', 'manager']:
+            customer.is_staff = True
+        else:
+            customer.is_staff = False
+        customer.save(update_fields=['is_staff'])
+
+        return Response(
+            {
+                "success": True,
+                "role": new_role,
+                "message": f"User '{customer.username}' role changed to '{new_role}'.",
+                "customer": AdminCustomerSerializer(customer).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class AdminInventoryViewSet(viewsets.ViewSet):
+    """
+    Inventory Management for administrators:
+    Low-stock detection (threshold <= 10), out-of-stock monitoring, single and batch stock adjustments.
+    """
+    permission_classes = [IsAdminRole]
+    serializer_class = AdminInventoryStockAdjustSerializer
+
+    def list(self, request):
+        qs = Product.objects.select_related('category').all()
+
+        filter_type = request.query_params.get('filter')
+        if filter_type == 'low_stock':
+            qs = qs.filter(stock__gt=0, stock__lte=10)
+        elif filter_type == 'out_of_stock':
+            qs = qs.filter(Q(stock=0) | Q(is_available=False))
+        elif filter_type == 'in_stock':
+            qs = qs.filter(stock__gt=10, is_available=True)
+
+        search = request.query_params.get('search')
+        if search:
+            qs = qs.filter(Q(name__icontains=search) | Q(id__icontains=search))
+
+        qs = qs.order_by('stock')
+
+        items = [
+            {
+                "id": p.id,
+                "name": p.name,
+                "weight": p.weight,
+                "category_id": p.category_id,
+                "category_name": p.category.name,
+                "price": str(p.price),
+                "stock": p.stock,
+                "is_available": p.is_available,
+                "is_low_stock": p.is_low_stock,
+                "is_out_of_stock": p.is_out_of_stock,
+                "image": request.build_absolute_uri(p.image.url) if p.image else None,
+            }
+            for p in qs
+        ]
+
+        return Response(
+            {
+                "success": True,
+                "total_items": len(items),
+                "low_stock_count": Product.objects.filter(stock__gt=0, stock__lte=10).count(),
+                "out_of_stock_count": Product.objects.filter(Q(stock=0) | Q(is_available=False)).count(),
+                "inventory": items,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=False, methods=['post'], url_path='adjust')
+    def adjust(self, request):
+        serializer = AdminInventoryStockAdjustSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        product = Product.objects.get(id=data['product_id'])
+        with transaction.atomic():
+            if 'stock' in data:
+                product.stock = data['stock']
+            elif 'adjustment' in data:
+                delta = data['adjustment']
+                if product.stock + delta < 0:
+                    return Response(
+                        {"success": False, "message": f"Stock cannot drop below 0. Current stock: {product.stock}."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                product.stock += delta
+
+            if product.stock == 0:
+                product.is_available = False
+            elif product.stock > 0 and not product.is_available:
+                product.is_available = True
+
+            product.save(update_fields=['stock', 'is_available', 'updated_at'])
+
+        return Response(
+            {
+                "success": True,
+                "message": f"Stock for '{product.name}' adjusted to {product.stock}.",
+                "product": AdminProductSerializer(product).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=False, methods=['post'], url_path='batch-adjust')
+    def batch_adjust(self, request):
+        serializer = AdminBatchStockAdjustSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        adjustments = serializer.validated_data['adjustments']
+
+        updated_products = []
+        with transaction.atomic():
+            for item in adjustments:
+                prod = Product.objects.get(id=item['product_id'])
+                if 'stock' in item:
+                    prod.stock = item['stock']
+                elif 'adjustment' in item:
+                    delta = item['adjustment']
+                    if prod.stock + delta < 0:
+                        raise serializers.ValidationError(
+                            f"Stock for '{prod.name}' cannot drop below 0 (current: {prod.stock}, adjustment: {delta})."
+                        )
+                    prod.stock += delta
+
+                if prod.stock == 0:
+                    prod.is_available = False
+                elif prod.stock > 0 and not prod.is_available:
+                    prod.is_available = True
+
+                prod.save(update_fields=['stock', 'is_available', 'updated_at'])
+                updated_products.append(prod)
+
+        return Response(
+            {
+                "success": True,
+                "message": f"Successfully updated stock for {len(updated_products)} product(s).",
+                "updated_count": len(updated_products),
+                "products": AdminProductSerializer(updated_products, many=True).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class AdminDashboardView(APIView):
+    """
+    Real-time Admin Dashboard Analytics:
+    Total products, active products, categories, customers, orders, today's metrics,
+    revenue, order breakdown by status, recent orders, bestsellers, and stock alerts.
+    All statistics are calculated dynamically from live SQLite database records.
+    """
+    permission_classes = [IsAdminRole]
+
+    @extend_schema(responses={200: OpenApiResponse(description="Real-time dashboard metrics")})
+    def get(self, request):
+        now = timezone.now()
+        today = now.date()
+
+        # Core entity counts
+        total_products = Product.objects.count()
+        active_products = Product.objects.filter(is_available=True).count()
+        total_categories = Category.objects.count()
+        total_customers = User.objects.filter(is_staff=False, is_superuser=False).count()
+        total_orders = Order.objects.count()
+
+        # Today's metrics
+        today_orders = Order.objects.filter(created_at__date=today)
+        today_orders_count = today_orders.count()
+        today_revenue = (
+            today_orders.exclude(status='cancelled')
+            .aggregate(rev=Sum('grand_total'))['rev'] or Decimal('0.00')
+        )
+
+        # Lifetime revenue (excluding cancelled orders)
+        total_revenue = (
+            Order.objects.exclude(status='cancelled')
+            .aggregate(rev=Sum('grand_total'))['rev'] or Decimal('0.00')
+        )
+
+        # Order breakdown by status
+        orders_by_status = {
+            s[0]: Order.objects.filter(status=s[0]).count()
+            for s in Order.STATUS_CHOICES
+        }
+
+        # Order breakdown by payment status
+        orders_by_payment_status = {
+            s[0]: Order.objects.filter(payment_status=s[0]).count()
+            for s in Order.PAYMENT_STATUS_CHOICES
+        }
+
+        # Stock alert counts
+        low_stock_count = Product.objects.filter(stock__gt=0, stock__lte=10).count()
+        out_of_stock_count = Product.objects.filter(Q(stock=0) | Q(is_available=False)).count()
+
+        # Recent orders (last 5)
+        recent_orders_qs = Order.objects.select_related('user').all().order_by('-created_at')[:5]
+        recent_orders_data = AdminOrderListSerializer(recent_orders_qs, many=True).data
+
+        # Top 5 best selling products (by non-cancelled order units sold)
+        best_sellers_qs = (
+            OrderItem.objects.exclude(order__status='cancelled')
+            .values('product_id', 'product_name')
+            .annotate(
+                total_units_sold=Sum('quantity'),
+                total_revenue=Sum('total_price'),
+            )
+            .order_by('-total_units_sold')[:5]
+        )
+        best_selling_products = list(best_sellers_qs)
+
+        # Low stock products list (top 5 critical)
+        low_stock_products_qs = Product.objects.filter(stock__gt=0, stock__lte=10).order_by('stock')[:5]
+        low_stock_products = AdminProductSerializer(low_stock_products_qs, many=True).data
+
+        # Out of stock products list (top 5)
+        out_of_stock_products_qs = Product.objects.filter(Q(stock=0) | Q(is_available=False)).order_by('stock')[:5]
+        out_of_stock_products = AdminProductSerializer(out_of_stock_products_qs, many=True).data
+
+        return Response(
+            {
+                "success": True,
+                "analytics": {
+                    "total_products": total_products,
+                    "active_products": active_products,
+                    "total_categories": total_categories,
+                    "total_customers": total_customers,
+                    "total_orders": total_orders,
+                    "today_orders_count": today_orders_count,
+                    "today_revenue": str(today_revenue),
+                    "total_revenue": str(total_revenue),
+                    "orders_by_status": orders_by_status,
+                    "orders_by_payment_status": orders_by_payment_status,
+                    "low_stock_count": low_stock_count,
+                    "out_of_stock_count": out_of_stock_count,
+                    "recent_orders": recent_orders_data,
+                    "best_selling_products": best_selling_products,
+                    "low_stock_products": low_stock_products,
+                    "out_of_stock_products": out_of_stock_products,
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
+
