@@ -617,10 +617,12 @@ class AdminUserSerializer(serializers.ModelSerializer):
 
 class AdminCategorySerializer(serializers.ModelSerializer):
     """
-    Category CRUD for administrators, with safe slug generation and product counters.
+    Category CRUD for administrators, with safe slug generation, product counters,
+    and explicit image removal support.
     """
     id = serializers.CharField(required=False, help_text="Slug ID (e.g. 'vegetables') or leave blank to auto-slugify")
     products_count = serializers.SerializerMethodField()
+    remove_image = serializers.BooleanField(required=False, write_only=True, default=False)
 
     class Meta:
         model = Category
@@ -630,6 +632,7 @@ class AdminCategorySerializer(serializers.ModelSerializer):
             'photo',
             'tint',
             'image',
+            'remove_image',
             'is_active',
             'products_count',
             'created_at',
@@ -641,6 +644,7 @@ class AdminCategorySerializer(serializers.ModelSerializer):
         return obj.products.count()
 
     def create(self, validated_data):
+        validated_data.pop('remove_image', None)
         cat_id = validated_data.get('id')
         if not cat_id:
             base_slug = slugify(validated_data['name']) or 'cat'
@@ -651,6 +655,14 @@ class AdminCategorySerializer(serializers.ModelSerializer):
                 counter += 1
             validated_data['id'] = slug
         return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        remove_image = validated_data.pop('remove_image', False)
+        if remove_image and 'image' not in validated_data:
+            if instance.image:
+                instance.image.delete(save=False)
+            instance.image = None
+        return super().update(instance, validated_data)
 
 
 class AdminProductSerializer(serializers.ModelSerializer):
@@ -852,9 +864,13 @@ class AdminCustomerSerializer(serializers.ModelSerializer):
         ]
 
     def get_orders_count(self, obj) -> int:
+        if hasattr(obj, 'annotated_orders_count'):
+            return obj.annotated_orders_count
         return obj.orders.count()
 
     def get_total_spent(self, obj) -> Decimal:
+        if hasattr(obj, 'annotated_total_spent'):
+            return obj.annotated_total_spent
         spent = obj.orders.exclude(status='cancelled').aggregate(total=models.Sum('grand_total'))['total']
         return spent or Decimal('0.00')
 
@@ -896,6 +912,6 @@ class AdminBatchStockAdjustSerializer(serializers.Serializer):
     """
     Batch stock adjustment payload.
     """
-    adjustments = AdminInventoryStockAdjustSerializer(many=True)
+    adjustments = AdminInventoryStockAdjustSerializer(many=True, allow_empty=False)
 
 

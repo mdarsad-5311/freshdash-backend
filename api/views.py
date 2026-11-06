@@ -1,9 +1,11 @@
 from decimal import Decimal
 from django.shortcuts import get_object_or_404
+from django.core.paginator import Paginator, EmptyPage, PageNotAnInteger
 from django.db import transaction
-from django.db.models import Prefetch, Sum, Count, Q
+from django.db.models import Prefetch, Sum, Count, Q, DecimalField
+from django.db.models.functions import Coalesce
 from django.utils import timezone
-from rest_framework import viewsets, status, permissions
+from rest_framework import viewsets, status, permissions, serializers
 from rest_framework.views import APIView
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
@@ -735,6 +737,7 @@ class AdminLoginView(APIView):
     Regular customer accounts are denied access with HTTP 403 Forbidden.
     """
     permission_classes = [permissions.AllowAny]
+    authentication_classes = []
     serializer_class = AdminLoginSerializer
     throttle_scope = 'login'
 
@@ -832,12 +835,41 @@ class AdminLogoutView(APIView):
 class AdminCategoryViewSet(viewsets.ModelViewSet):
     """
     Category Management for administrators:
-    Full CRUD, safe deletion protection, image uploads, and active status toggle.
+    Full CRUD, safe deletion protection, image uploads, search, filtering, and active status toggle.
     """
     permission_classes = [IsAdminRole]
     queryset = Category.objects.all().order_by('name')
     serializer_class = AdminCategorySerializer
     parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def get_queryset(self):
+        qs = Category.objects.all()
+
+        # Active / Inactive status filter
+        is_active = self.request.query_params.get('is_active')
+        if is_active is not None and is_active != '':
+            if is_active.lower() in ['true', '1']:
+                qs = qs.filter(is_active=True)
+            elif is_active.lower() in ['false', '0']:
+                qs = qs.filter(is_active=False)
+
+        # Search filter (name and slug ID)
+        search = self.request.query_params.get('search')
+        if search:
+            search = search.strip()
+            qs = qs.filter(
+                Q(name__icontains=search) |
+                Q(id__icontains=search)
+            )
+
+        # Ordering
+        ordering = self.request.query_params.get('ordering')
+        if ordering in ['name', '-name', 'created_at', '-created_at']:
+            qs = qs.order_by(ordering)
+        else:
+            qs = qs.order_by('name')
+
+        return qs
 
     def destroy(self, request, *args, **kwargs):
         category = self.get_object()
@@ -907,9 +939,9 @@ class AdminProductViewSet(viewsets.ModelViewSet):
         if stock_status == 'low_stock':
             qs = qs.filter(stock__gt=0, stock__lte=10)
         elif stock_status == 'out_of_stock':
-            qs = qs.filter(Q(stock=0) | Q(is_available=False))
+            qs = qs.filter(stock=0)
         elif stock_status == 'in_stock':
-            qs = qs.filter(stock__gt=10, is_available=True)
+            qs = qs.filter(stock__gt=10)
 
         # Search filter
         search = self.request.query_params.get('search')
@@ -1038,11 +1070,16 @@ class AdminOrderViewSet(viewsets.ModelViewSet):
         # Payment method filter
         payment_method = self.request.query_params.get('payment_method')
         if payment_method:
-            qs = qs.filter(payment_method=payment_method)
+            valid_methods = [c[0] for c in Order.PAYMENT_METHOD_CHOICES]
+            if payment_method in valid_methods:
+                qs = qs.filter(payment_method=payment_method)
+            else:
+                qs = qs.none()
 
         # Search filter (order number, customer name, email)
         search = self.request.query_params.get('search')
         if search:
+            search = search.strip()
             qs = qs.filter(
                 Q(order_number__icontains=search) |
                 Q(user__username__icontains=search) |
@@ -1059,7 +1096,20 @@ class AdminOrderViewSet(viewsets.ModelViewSet):
         if date_to:
             qs = qs.filter(created_at__date__lte=date_to)
 
-        return qs.order_by('-created_at')
+        # Dynamic Sorting
+        ordering = self.request.query_params.get('ordering')
+        ALLOWED_ORDERING = {
+            '-created_at': ['-created_at', '-id'],
+            'created_at': ['created_at', 'id'],
+            '-grand_total': ['-grand_total', '-created_at', '-id'],
+            'grand_total': ['grand_total', '-created_at', '-id'],
+        }
+        if ordering in ALLOWED_ORDERING:
+            qs = qs.order_by(*ALLOWED_ORDERING[ordering])
+        else:
+            qs = qs.order_by('-created_at', '-id')
+
+        return qs
 
     def update(self, request, *args, **kwargs):
         partial = kwargs.pop('partial', False)
@@ -1068,13 +1118,49 @@ class AdminOrderViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
+        ALLOWED_STATUS_TRANSITIONS = {
+            'pending': {'placed', 'confirmed', 'processing', 'shipped', 'out_for_delivery', 'delivered', 'cancelled'},
+            'placed': {'confirmed', 'processing', 'shipped', 'out_for_delivery', 'delivered', 'cancelled'},
+            'confirmed': {'processing', 'shipped', 'out_for_delivery', 'delivered', 'cancelled'},
+            'processing': {'shipped', 'out_for_delivery', 'delivered', 'cancelled'},
+            'shipped': {'out_for_delivery', 'delivered', 'cancelled'},
+            'out_for_delivery': {'delivered', 'cancelled'},
+            'delivered': set(),
+            'cancelled': set(),
+        }
+
         with transaction.atomic():
             new_status = data.get('status')
             if new_status and new_status != order.status:
                 old_status = order.status
+                if old_status == 'delivered':
+                    return Response(
+                        {
+                            "success": False,
+                            "message": f"Order #{order.order_number} has already been delivered and cannot be transitioned to '{new_status}'.",
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if old_status == 'cancelled':
+                    return Response(
+                        {
+                            "success": False,
+                            "message": f"Order #{order.order_number} is cancelled and cannot be reopened or transitioned to '{new_status}'.",
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if new_status not in ALLOWED_STATUS_TRANSITIONS.get(old_status, set()):
+                    return Response(
+                        {
+                            "success": False,
+                            "message": f"Invalid status transition from '{old_status}' to '{new_status}'.",
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
                 order.status = new_status
                 # Restore stock on cancellation
-                if new_status == 'cancelled' and old_status != 'cancelled':
+                if new_status == 'cancelled':
                     for item in order.items.select_related('product'):
                         if item.product:
                             restored = item.quantity * 2 if item.large else item.quantity
@@ -1121,6 +1207,16 @@ class AdminCustomerViewSet(viewsets.ReadOnlyModelViewSet):
     def get_queryset(self):
         qs = User.objects.select_related('profile').prefetch_related('orders', 'addresses').all()
 
+        # Optimize customer query performance using SQL annotations
+        qs = qs.annotate(
+            annotated_orders_count=Count('orders', distinct=True),
+            annotated_total_spent=Coalesce(
+                Sum('orders__grand_total', filter=~Q(orders__status='cancelled')),
+                Decimal('0.00'),
+                output_field=DecimalField(max_digits=12, decimal_places=2)
+            )
+        )
+
         # Role filter
         role = self.request.query_params.get('role')
         if role:
@@ -1145,7 +1241,23 @@ class AdminCustomerViewSet(viewsets.ReadOnlyModelViewSet):
                 Q(profile__phone_number__icontains=search)
             )
 
-        return qs.order_by('-date_joined')
+        # Dynamic Sorting
+        ordering = self.request.query_params.get('ordering')
+        ORDERING_MAP = {
+            'username': ['username', '-date_joined', 'id'],
+            '-username': ['-username', '-date_joined', 'id'],
+            'date_joined': ['date_joined', 'id'],
+            '-date_joined': ['-date_joined', 'id'],
+            'orders_count': ['annotated_orders_count', '-date_joined', 'id'],
+            '-orders_count': ['-annotated_orders_count', '-date_joined', 'id'],
+            'total_spent': ['annotated_total_spent', '-date_joined', 'id'],
+            '-total_spent': ['-annotated_total_spent', '-date_joined', 'id'],
+        }
+
+        if ordering in ORDERING_MAP:
+            return qs.order_by(*ORDERING_MAP[ordering])
+
+        return qs.order_by('-date_joined', 'id')
 
     @action(detail=True, methods=['post'], url_path='toggle-status')
     def toggle_status(self, request, pk=None):
@@ -1206,26 +1318,79 @@ class AdminInventoryViewSet(viewsets.ViewSet):
     """
     Inventory Management for administrators:
     Low-stock detection (threshold <= 10), out-of-stock monitoring, single and batch stock adjustments.
+    Supports server-side pagination, allowlisted sorting, category and stock status filtering.
     """
     permission_classes = [IsAdminRole]
     serializer_class = AdminInventoryStockAdjustSerializer
 
+    ORDERING_MAP = {
+        'stock': ['stock', 'id'],
+        '-stock': ['-stock', 'id'],
+        'name': ['name', 'id'],
+        '-name': ['-name', 'id'],
+        'category': ['category__name', 'name', 'id'],
+        '-category': ['-category__name', 'name', 'id'],
+        'price': ['price', 'id'],
+        '-price': ['-price', 'id'],
+    }
+
     def list(self, request):
         qs = Product.objects.select_related('category').all()
 
+        # Category filter
+        category = request.query_params.get('category')
+        if category:
+            qs = qs.filter(category_id=category)
+
+        # Stock status filter
         filter_type = request.query_params.get('filter')
         if filter_type == 'low_stock':
             qs = qs.filter(stock__gt=0, stock__lte=10)
         elif filter_type == 'out_of_stock':
-            qs = qs.filter(Q(stock=0) | Q(is_available=False))
+            qs = qs.filter(stock=0)
         elif filter_type == 'in_stock':
-            qs = qs.filter(stock__gt=10, is_available=True)
+            qs = qs.filter(stock__gt=10)
 
+        # Search filter by produce name or ID
         search = request.query_params.get('search')
-        if search:
-            qs = qs.filter(Q(name__icontains=search) | Q(id__icontains=search))
+        if search and search.strip():
+            search_term = search.strip()
+            qs = qs.filter(Q(name__icontains=search_term) | Q(id__icontains=search_term))
 
-        qs = qs.order_by('stock')
+        # Dynamic allowlisted ordering with deterministic tie-breaker
+        ordering = request.query_params.get('ordering')
+        if ordering in self.ORDERING_MAP:
+            qs = qs.order_by(*self.ORDERING_MAP[ordering])
+        else:
+            qs = qs.order_by(*self.ORDERING_MAP['stock'])
+
+        # Pagination: supports page and page_size safely
+        page_size_param = request.query_params.get('page_size', 20)
+        try:
+            page_size = max(1, min(int(page_size_param), 100))
+        except (ValueError, TypeError):
+            page_size = 20
+
+        paginator = Paginator(qs, page_size)
+        total_count = paginator.count
+        total_pages = paginator.num_pages or 1
+
+        page_param = request.query_params.get('page', 1)
+        try:
+            page_number = int(page_param)
+            if page_number < 1:
+                page_number = 1
+            page_obj = paginator.page(page_number)
+        except (PageNotAnInteger, ValueError, TypeError):
+            page_number = 1
+            page_obj = paginator.page(1)
+        except EmptyPage:
+            # Safely clamp out-of-range page numbers
+            page_number = max(1, total_pages)
+            try:
+                page_obj = paginator.page(page_number)
+            except EmptyPage:
+                page_obj = []
 
         items = [
             {
@@ -1233,7 +1398,7 @@ class AdminInventoryViewSet(viewsets.ViewSet):
                 "name": p.name,
                 "weight": p.weight,
                 "category_id": p.category_id,
-                "category_name": p.category.name,
+                "category_name": p.category.name if p.category else "",
                 "price": str(p.price),
                 "stock": p.stock,
                 "is_available": p.is_available,
@@ -1241,16 +1406,21 @@ class AdminInventoryViewSet(viewsets.ViewSet):
                 "is_out_of_stock": p.is_out_of_stock,
                 "image": request.build_absolute_uri(p.image.url) if p.image else None,
             }
-            for p in qs
+            for p in page_obj
         ]
 
         return Response(
             {
                 "success": True,
-                "total_items": len(items),
+                "count": total_count,
+                "total_items": total_count,
+                "total_pages": total_pages,
+                "current_page": page_number,
+                "page_size": page_size,
                 "low_stock_count": Product.objects.filter(stock__gt=0, stock__lte=10).count(),
-                "out_of_stock_count": Product.objects.filter(Q(stock=0) | Q(is_available=False)).count(),
+                "out_of_stock_count": Product.objects.filter(stock=0).count(),
                 "inventory": items,
+                "results": items,
             },
             status=status.HTTP_200_OK,
         )
@@ -1261,8 +1431,11 @@ class AdminInventoryViewSet(viewsets.ViewSet):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
-        product = Product.objects.get(id=data['product_id'])
         with transaction.atomic():
+            # select_for_update() inside atomic transaction
+            # On SQLite this operates under file-level database locks;
+            # on PostgreSQL/MySQL it provides row-level locking.
+            product = Product.objects.select_for_update().get(id=data['product_id'])
             if 'stock' in data:
                 product.stock = data['stock']
             elif 'adjustment' in data:
@@ -1299,7 +1472,10 @@ class AdminInventoryViewSet(viewsets.ViewSet):
         updated_products = []
         with transaction.atomic():
             for item in adjustments:
-                prod = Product.objects.get(id=item['product_id'])
+                # select_for_update() inside atomic transaction
+                # On SQLite this operates under file-level database locks;
+                # on PostgreSQL/MySQL it provides row-level locking.
+                prod = Product.objects.select_for_update().get(id=item['product_id'])
                 if 'stock' in item:
                     prod.stock = item['stock']
                 elif 'adjustment' in item:
@@ -1378,7 +1554,7 @@ class AdminDashboardView(APIView):
 
         # Stock alert counts
         low_stock_count = Product.objects.filter(stock__gt=0, stock__lte=10).count()
-        out_of_stock_count = Product.objects.filter(Q(stock=0) | Q(is_available=False)).count()
+        out_of_stock_count = Product.objects.filter(stock=0).count()
 
         # Recent orders (last 5)
         recent_orders_qs = Order.objects.select_related('user').all().order_by('-created_at')[:5]
@@ -1401,7 +1577,7 @@ class AdminDashboardView(APIView):
         low_stock_products = AdminProductSerializer(low_stock_products_qs, many=True).data
 
         # Out of stock products list (top 5)
-        out_of_stock_products_qs = Product.objects.filter(Q(stock=0) | Q(is_available=False)).order_by('stock')[:5]
+        out_of_stock_products_qs = Product.objects.filter(stock=0).order_by('stock')[:5]
         out_of_stock_products = AdminProductSerializer(out_of_stock_products_qs, many=True).data
 
         return Response(

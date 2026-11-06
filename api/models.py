@@ -68,7 +68,7 @@ class Product(models.Model):
 
     @property
     def is_out_of_stock(self) -> bool:
-        return self.stock == 0 or not self.is_available
+        return self.stock == 0
 
 
 class Address(models.Model):

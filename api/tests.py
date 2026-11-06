@@ -1188,6 +1188,77 @@ class AdminManagementSystemAPITests(APITestCase):
         self.assertEqual(res.status_code, status.HTTP_204_NO_CONTENT)
         self.assertFalse(Product.objects.filter(id='temp-product').exists())
 
+    def test_product_stock_filters_and_unavailable_separation(self):
+        """
+        Regression test:
+        1. out_of_stock: ONLY products where stock = 0
+        2. low_stock: ONLY products where 0 < stock <= 10
+        3. in_stock: ONLY products where stock > 10
+        4. is_available: Separate availability filter
+        5. Unavailable product with 50 units (like Kale) must NOT appear in out_of_stock
+        """
+        kale = Product.objects.create(
+            id='test-kale',
+            name='Organic Kale',
+            weight='250 g',
+            price=Decimal('20.00'),
+            original=Decimal('25.00'),
+            stock=50,
+            is_available=False,
+            category=self.category_veg
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+
+        # Case 1: out_of_stock filter (Only stock == 0)
+        res_out = self.client.get('/api/v1/admin/products/?stock_status=out_of_stock')
+        self.assertEqual(res_out.status_code, status.HTTP_200_OK)
+        items_out = res_out.data.get('results', res_out.data)
+        out_ids = [p['id'] for p in items_out]
+        self.assertIn('mango', out_ids)
+        self.assertNotIn('test-kale', out_ids)
+        self.assertNotIn('carrot', out_ids)
+        self.assertNotIn('spinach', out_ids)
+
+        # Case 2: low_stock filter (0 < stock <= 10)
+        res_low = self.client.get('/api/v1/admin/products/?stock_status=low_stock')
+        self.assertEqual(res_low.status_code, status.HTTP_200_OK)
+        items_low = res_low.data.get('results', res_low.data)
+        low_ids = [p['id'] for p in items_low]
+        self.assertIn('carrot', low_ids)
+        self.assertNotIn('mango', low_ids)
+        self.assertNotIn('spinach', low_ids)
+        self.assertNotIn('test-kale', low_ids)
+
+        # Case 3: in_stock filter (stock > 10)
+        res_in = self.client.get('/api/v1/admin/products/?stock_status=in_stock')
+        self.assertEqual(res_in.status_code, status.HTTP_200_OK)
+        items_in = res_in.data.get('results', res_in.data)
+        in_ids = [p['id'] for p in items_in]
+        self.assertIn('spinach', in_ids)
+        self.assertIn('test-kale', in_ids)
+        self.assertNotIn('mango', in_ids)
+        self.assertNotIn('carrot', in_ids)
+
+        # Case 4: Separate availability filter combined with in_stock
+        res_in_hidden = self.client.get('/api/v1/admin/products/?stock_status=in_stock&is_available=false')
+        self.assertEqual(res_in_hidden.status_code, status.HTTP_200_OK)
+        items_in_hidden = res_in_hidden.data.get('results', res_in_hidden.data)
+        in_hidden_ids = [p['id'] for p in items_in_hidden]
+        self.assertIn('test-kale', in_hidden_ids)
+        self.assertNotIn('spinach', in_hidden_ids)
+
+        res_in_active = self.client.get('/api/v1/admin/products/?stock_status=in_stock&is_available=true')
+        self.assertEqual(res_in_active.status_code, status.HTTP_200_OK)
+        items_in_active = res_in_active.data.get('results', res_in_active.data)
+        in_active_ids = [p['id'] for p in items_in_active]
+        self.assertIn('spinach', in_active_ids)
+        self.assertNotIn('test-kale', in_active_ids)
+
+        # Case 5: Model property is_out_of_stock must be False for Kale
+        self.assertFalse(kale.is_out_of_stock)
+        self.assertFalse(kale.is_low_stock)
+
     # 3. Category Management Tests
     def test_admin_list_categories(self):
         self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
@@ -1226,6 +1297,159 @@ class AdminManagementSystemAPITests(APITestCase):
         res = self.client.post('/api/v1/admin/categories/vegetables/toggle-status/')
         self.assertEqual(res.status_code, status.HTTP_200_OK)
         self.assertFalse(res.data['is_active'])
+
+    def test_admin_category_search_and_filtering(self):
+        """
+        Verify:
+        - Search by name & slug
+        - Active / Inactive filtering
+        - Combined search + status filtering
+        """
+        Category.objects.create(id='fruits', name='Seasonal Fruits', photo=2, tint='#FFF0E8', is_active=True)
+        Category.objects.create(id='inactive-herbs', name='Rare Herbs', photo=3, tint='#F8F5DD', is_active=False)
+
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+
+        # 1. Search by name
+        res_search_name = self.client.get('/api/v1/admin/categories/?search=Fruits')
+        self.assertEqual(res_search_name.status_code, status.HTTP_200_OK)
+        items = res_search_name.data.get('results', res_search_name.data)
+        ids = [c['id'] for c in items]
+        self.assertIn('fruits', ids)
+        self.assertNotIn('vegetables', ids)
+        self.assertNotIn('inactive-herbs', ids)
+
+        # 2. Search by slug / id
+        res_search_slug = self.client.get('/api/v1/admin/categories/?search=inactive-herbs')
+        self.assertEqual(res_search_slug.status_code, status.HTTP_200_OK)
+        items = res_search_slug.data.get('results', res_search_slug.data)
+        ids = [c['id'] for c in items]
+        self.assertEqual(ids, ['inactive-herbs'])
+
+        # 3. Active filter (is_active=true)
+        res_active = self.client.get('/api/v1/admin/categories/?is_active=true')
+        self.assertEqual(res_active.status_code, status.HTTP_200_OK)
+        items = res_active.data.get('results', res_active.data)
+        ids = [c['id'] for c in items]
+        self.assertIn('vegetables', ids)
+        self.assertIn('fruits', ids)
+        self.assertNotIn('inactive-herbs', ids)
+
+        # 4. Inactive filter (is_active=false)
+        res_inactive = self.client.get('/api/v1/admin/categories/?is_active=false')
+        self.assertEqual(res_inactive.status_code, status.HTTP_200_OK)
+        items = res_inactive.data.get('results', res_inactive.data)
+        ids = [c['id'] for c in items]
+        self.assertEqual(ids, ['inactive-herbs'])
+
+        # 5. Combined search + status filter
+        res_combined_match = self.client.get('/api/v1/admin/categories/?search=Herbs&is_active=false')
+        self.assertEqual(res_combined_match.status_code, status.HTTP_200_OK)
+        items = res_combined_match.data.get('results', res_combined_match.data)
+        ids = [c['id'] for c in items]
+        self.assertEqual(ids, ['inactive-herbs'])
+
+        res_combined_nomatch = self.client.get('/api/v1/admin/categories/?search=Herbs&is_active=true')
+        self.assertEqual(res_combined_nomatch.status_code, status.HTTP_200_OK)
+        items = res_combined_nomatch.data.get('results', res_combined_nomatch.data)
+        self.assertEqual(len(items), 0)
+
+    def test_admin_category_image_removal_and_lifecycle(self):
+        """
+        Phase 2.1 Regression Tests:
+        - (d) Add Category with image works
+        - (b) PATCH without image or remove_image flag preserves existing image
+        - (c) PATCH with new image replaces existing image
+        - (a) PATCH with remove_image=true clears image
+        - (e) remove_image flag does not interfere with other fields
+        - PATCH with remove_image=false preserves image
+        """
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+
+        def create_test_image(name='test.png'):
+            buf = BytesIO()
+            img = Image.new('RGB', (40, 40), color='green')
+            img.save(buf, 'PNG')
+            buf.seek(0)
+            return SimpleUploadedFile(name, buf.read(), content_type='image/png')
+
+        # 1. Add Category with image
+        initial_image = create_test_image('initial_cat.png')
+        create_payload = {
+            'name': 'Bakery Goods',
+            'tint': '#FFF5EE',
+            'image': initial_image,
+        }
+        res_create = self.client.post('/api/v1/admin/categories/', create_payload, format='multipart')
+        self.assertEqual(res_create.status_code, status.HTTP_201_CREATED)
+        self.assertIsNotNone(res_create.data['image'])
+        cat_id = res_create.data['id']
+        cat = Category.objects.get(id=cat_id)
+        self.assertTrue(bool(cat.image))
+
+        # 2. PATCH without image or remove flag -> preserves existing image
+        res_preserve = self.client.patch(
+            f'/api/v1/admin/categories/{cat_id}/',
+            {'name': 'Artisan Bakery Goods'},
+            format='multipart'
+        )
+        self.assertEqual(res_preserve.status_code, status.HTTP_200_OK)
+        cat.refresh_from_db()
+        self.assertTrue(bool(cat.image))
+        self.assertIsNotNone(res_preserve.data['image'])
+        self.assertEqual(res_preserve.data['name'], 'Artisan Bakery Goods')
+
+        # 3. PATCH with new image -> replaces existing image
+        replacement_image = create_test_image('replacement_cat.png')
+        res_replace = self.client.patch(
+            f'/api/v1/admin/categories/{cat_id}/',
+            {'image': replacement_image},
+            format='multipart'
+        )
+        self.assertEqual(res_replace.status_code, status.HTTP_200_OK)
+        cat.refresh_from_db()
+        self.assertTrue(bool(cat.image))
+        self.assertIn('replacement_cat', cat.image.name)
+
+        # 4. PATCH with remove_image='true' -> clears image, does not interfere with other fields
+        res_remove = self.client.patch(
+            f'/api/v1/admin/categories/{cat_id}/',
+            {'remove_image': 'true', 'name': 'Bakery Standard', 'tint': '#E0EEEE'},
+            format='multipart'
+        )
+        self.assertEqual(res_remove.status_code, status.HTTP_200_OK)
+        cat.refresh_from_db()
+        self.assertFalse(bool(cat.image))
+        self.assertIsNone(res_remove.data['image'])
+        self.assertEqual(res_remove.data['name'], 'Bakery Standard')
+        self.assertEqual(res_remove.data['tint'], '#E0EEEE')
+
+        # 5. PATCH with remove_image='false' preserves state
+        readded_image = create_test_image('readded_cat.png')
+        res_readd = self.client.patch(
+            f'/api/v1/admin/categories/{cat_id}/',
+            {'image': readded_image},
+            format='multipart'
+        )
+        self.assertEqual(res_readd.status_code, status.HTTP_200_OK)
+        cat.refresh_from_db()
+        self.assertTrue(bool(cat.image))
+
+        res_false_flag = self.client.patch(
+            f'/api/v1/admin/categories/{cat_id}/',
+            {'remove_image': 'false', 'name': 'Image Preserved Cat'},
+            format='multipart'
+        )
+        self.assertEqual(res_false_flag.status_code, status.HTTP_200_OK)
+        cat.refresh_from_db()
+        self.assertTrue(bool(cat.image))
+        self.assertIsNotNone(res_false_flag.data['image'])
+        self.assertEqual(res_false_flag.data['name'], 'Image Preserved Cat')
+
+        # Clean up
+        if cat.image:
+            cat.image.delete(save=False)
+        cat.delete()
 
     # 4. Order Management & Stock Restoration Tests
     def test_admin_list_orders_and_detail(self):
@@ -1314,6 +1538,307 @@ class AdminManagementSystemAPITests(APITestCase):
         self.product_spinach.refresh_from_db()
         self.assertEqual(self.product_spinach.stock, initial_stock + 3)
 
+    def test_admin_orders_pagination(self):
+        """
+        Phase 3: Verify Admin Orders pagination:
+        - Page 1 returns correct page_size and total_pages
+        - Page 2 returns remaining items
+        - Invalid page number returns HTTP 404
+        """
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        # Create 22 orders
+        for i in range(22):
+            Order.objects.create(
+                order_number=f'PAGEORD{i:03d}',
+                user=self.customer,
+                status='placed',
+                item_total=Decimal('50.00'),
+                grand_total=Decimal('50.00'),
+                payment_method='COD',
+                payment_status='pending',
+            )
+
+        # Page 1
+        res_p1 = self.client.get('/api/v1/admin/orders/?page=1')
+        self.assertEqual(res_p1.status_code, status.HTTP_200_OK)
+        self.assertGreaterEqual(res_p1.data['count'], 22)
+        self.assertGreaterEqual(res_p1.data['total_pages'], 2)
+        self.assertEqual(res_p1.data['current_page'], 1)
+        self.assertEqual(len(res_p1.data['results']), 20)
+
+        # Page 2
+        res_p2 = self.client.get('/api/v1/admin/orders/?page=2')
+        self.assertEqual(res_p2.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_p2.data['current_page'], 2)
+        self.assertGreaterEqual(len(res_p2.data['results']), 2)
+
+        # Invalid page
+        res_invalid = self.client.get('/api/v1/admin/orders/?page=9999')
+        self.assertEqual(res_invalid.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_admin_orders_search_and_filter(self):
+        """
+        Phase 3: Verify Admin Orders search and filtering:
+        - Search by order_number
+        - Search by username and email
+        - Combined search + status filtering
+        """
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        special_order = Order.objects.create(
+            order_number='SEARCH_SPECIAL_999',
+            user=self.customer,
+            status='placed',
+            item_total=Decimal('90.00'),
+            grand_total=Decimal('90.00'),
+            payment_method='UPI',
+            payment_status='pending',
+        )
+
+        # 1. Search by order number
+        res_num = self.client.get('/api/v1/admin/orders/?search=SEARCH_SPECIAL')
+        self.assertEqual(res_num.status_code, status.HTTP_200_OK)
+        items = res_num.data.get('results', res_num.data)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]['order_number'], 'SEARCH_SPECIAL_999')
+
+        # 2. Search by customer username ('charlie')
+        res_user = self.client.get('/api/v1/admin/orders/?search=charlie')
+        self.assertEqual(res_user.status_code, status.HTTP_200_OK)
+        items_user = res_user.data.get('results', res_user.data)
+        self.assertTrue(all('charlie' in o['customer_username'] for o in items_user))
+
+        # 3. Combined search + status filter
+        res_comb = self.client.get('/api/v1/admin/orders/?search=SEARCH_SPECIAL&status=placed')
+        self.assertEqual(res_comb.status_code, status.HTTP_200_OK)
+        items_comb = res_comb.data.get('results', res_comb.data)
+        self.assertEqual(len(items_comb), 1)
+
+        res_comb_nomatch = self.client.get('/api/v1/admin/orders/?search=SEARCH_SPECIAL&status=delivered')
+        self.assertEqual(res_comb_nomatch.status_code, status.HTTP_200_OK)
+        items_nomatch = res_comb_nomatch.data.get('results', res_comb_nomatch.data)
+        self.assertEqual(len(items_nomatch), 0)
+
+    def test_admin_orders_dynamic_sorting(self):
+        """
+        Phase 3: Verify Admin Orders sorting:
+        - Newest first (-created_at)
+        - Oldest first (created_at)
+        - Highest amount (-grand_total)
+        - Lowest amount (grand_total)
+        - Invalid ordering falls back to default
+        """
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        # Clear existing test orders to test strict sorting order
+        Order.objects.all().delete()
+
+        o1 = Order.objects.create(
+            order_number='SORT_O1_LOW',
+            user=self.customer,
+            status='placed',
+            item_total=Decimal('15.00'),
+            grand_total=Decimal('15.00'),
+            payment_method='COD'
+        )
+        o2 = Order.objects.create(
+            order_number='SORT_O2_HIGH',
+            user=self.customer,
+            status='placed',
+            item_total=Decimal('450.00'),
+            grand_total=Decimal('450.00'),
+            payment_method='UPI'
+        )
+        o3 = Order.objects.create(
+            order_number='SORT_O3_MID',
+            user=self.customer,
+            status='placed',
+            item_total=Decimal('120.00'),
+            grand_total=Decimal('120.00'),
+            payment_method='Card'
+        )
+
+        # 1. Amount: High to Low
+        res_high = self.client.get('/api/v1/admin/orders/?ordering=-grand_total')
+        self.assertEqual(res_high.status_code, status.HTTP_200_OK)
+        items = res_high.data['results']
+        totals = [float(x['grand_total']) for x in items]
+        self.assertEqual(totals, [450.0, 120.0, 15.0])
+
+        # 2. Amount: Low to High
+        res_low = self.client.get('/api/v1/admin/orders/?ordering=grand_total')
+        self.assertEqual(res_low.status_code, status.HTTP_200_OK)
+        items_low = res_low.data['results']
+        totals_low = [float(x['grand_total']) for x in items_low]
+        self.assertEqual(totals_low, [15.0, 120.0, 450.0])
+
+        # 3. Oldest first (created_at)
+        res_oldest = self.client.get('/api/v1/admin/orders/?ordering=created_at')
+        self.assertEqual(res_oldest.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_oldest.data['results'][0]['order_number'], 'SORT_O1_LOW')
+
+        # 4. Newest first (-created_at)
+        res_newest = self.client.get('/api/v1/admin/orders/?ordering=-created_at')
+        self.assertEqual(res_newest.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_newest.data['results'][0]['order_number'], 'SORT_O3_MID')
+
+        # 5. Invalid ordering parameter falls back to default newest first
+        res_invalid = self.client.get('/api/v1/admin/orders/?ordering=malicious_sql_injection_attempt')
+        self.assertEqual(res_invalid.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_invalid.data['results'][0]['order_number'], 'SORT_O3_MID')
+
+    def test_admin_orders_status_transitions_and_inventory_safety(self):
+        """
+        Phase 3: Verify explicit status transition validation & inventory safety:
+        - Valid transitions succeed
+        - Delivered orders cannot transition to cancelled (HTTP 400)
+        - Cancelled orders cannot transition to confirmed (HTTP 400)
+        - Invalid status choice returns HTTP 400
+        - Failed transition does not modify stock
+        - Inventory is restored on valid cancellation and never restored twice
+        """
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        initial_stock = self.product_spinach.stock
+
+        # Create order
+        order = Order.objects.create(
+            order_number='TRANS_TEST_01',
+            user=self.customer,
+            status='placed',
+            item_total=Decimal('50.00'),
+            grand_total=Decimal('50.00')
+        )
+        OrderItem.objects.create(
+            order=order,
+            product=self.product_spinach,
+            product_name=self.product_spinach.name,
+            weight=self.product_spinach.weight,
+            quantity=2,
+            unit_price=Decimal('25.00'),
+            total_price=Decimal('50.00')
+        )
+
+        # 1. Valid forward transitions: placed -> confirmed -> processing -> shipped -> delivered
+        for st in ['confirmed', 'processing', 'shipped', 'delivered']:
+            res = self.client.patch(f'/api/v1/admin/orders/{order.order_number}/', {'status': st})
+            self.assertEqual(res.status_code, status.HTTP_200_OK)
+            order.refresh_from_db()
+            self.assertEqual(order.status, st)
+
+        # Spinach stock should NOT have changed during normal fulfillment
+        self.product_spinach.refresh_from_db()
+        self.assertEqual(self.product_spinach.stock, initial_stock)
+
+        # 2. Rule 1: Delivered order MUST NOT transition to cancelled
+        res_cancel_delivered = self.client.patch(f'/api/v1/admin/orders/{order.order_number}/', {'status': 'cancelled'})
+        self.assertEqual(res_cancel_delivered.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('already been delivered', res_cancel_delivered.data['message'])
+
+        # Stock remains untouched
+        self.product_spinach.refresh_from_db()
+        self.assertEqual(self.product_spinach.stock, initial_stock)
+
+        # 3. Rule: Invalid status choices rejected
+        res_invalid_choice = self.client.patch(f'/api/v1/admin/orders/{order.order_number}/', {'status': 'nonexistent_state'})
+        self.assertEqual(res_invalid_choice.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # 4. Create another placed order to test valid cancellation and inventory restoration
+        order_to_cancel = Order.objects.create(
+            order_number='TRANS_TEST_02',
+            user=self.customer,
+            status='placed',
+            item_total=Decimal('25.00'),
+            grand_total=Decimal('25.00')
+        )
+        OrderItem.objects.create(
+            order=order_to_cancel,
+            product=self.product_spinach,
+            product_name=self.product_spinach.name,
+            weight=self.product_spinach.weight,
+            quantity=1,
+            unit_price=Decimal('25.00'),
+            total_price=Decimal('25.00')
+        )
+
+        res_cancel = self.client.patch(f'/api/v1/admin/orders/{order_to_cancel.order_number}/', {'status': 'cancelled'})
+        self.assertEqual(res_cancel.status_code, status.HTTP_200_OK)
+        order_to_cancel.refresh_from_db()
+        self.assertEqual(order_to_cancel.status, 'cancelled')
+
+        # Stock restored by +1
+        self.product_spinach.refresh_from_db()
+        self.assertEqual(self.product_spinach.stock, initial_stock + 1)
+
+        # 5. Rule 2: Cancelled order MUST NOT transition back to confirmed/placed
+        res_reopen = self.client.patch(f'/api/v1/admin/orders/{order_to_cancel.order_number}/', {'status': 'confirmed'})
+        self.assertEqual(res_reopen.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('is cancelled and cannot be reopened', res_reopen.data['message'])
+
+        # Stock remains preserved (not deducted or restored incorrectly)
+        self.product_spinach.refresh_from_db()
+        self.assertEqual(self.product_spinach.stock, initial_stock + 1)
+
+    def test_admin_orders_payment_method_filtering(self):
+        """
+        Phase 3: Verify Payment Method filtering:
+        - Valid payment methods return matching orders
+        - Invalid payment method returns empty list
+        - Combined payment method and status filter
+        """
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        Order.objects.all().delete()
+
+        Order.objects.create(
+            order_number='PM_COD_01',
+            user=self.customer,
+            status='placed',
+            item_total=Decimal('50.00'),
+            grand_total=Decimal('50.00'),
+            payment_method='COD'
+        )
+        Order.objects.create(
+            order_number='PM_UPI_01',
+            user=self.customer,
+            status='placed',
+            item_total=Decimal('100.00'),
+            grand_total=Decimal('100.00'),
+            payment_method='UPI'
+        )
+        Order.objects.create(
+            order_number='PM_CARD_01',
+            user=self.customer,
+            status='delivered',
+            item_total=Decimal('150.00'),
+            grand_total=Decimal('150.00'),
+            payment_method='Card'
+        )
+
+        # 1. Filter COD
+        res_cod = self.client.get('/api/v1/admin/orders/?payment_method=COD')
+        self.assertEqual(res_cod.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_cod.data['count'], 1)
+        self.assertEqual(res_cod.data['results'][0]['order_number'], 'PM_COD_01')
+
+        # 2. Filter UPI
+        res_upi = self.client.get('/api/v1/admin/orders/?payment_method=UPI')
+        self.assertEqual(res_upi.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_upi.data['count'], 1)
+        self.assertEqual(res_upi.data['results'][0]['order_number'], 'PM_UPI_01')
+
+        # 3. Filter Invalid method -> empty results (HTTP 200)
+        res_invalid_pm = self.client.get('/api/v1/admin/orders/?payment_method=crypto_bitcoin')
+        self.assertEqual(res_invalid_pm.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_invalid_pm.data['count'], 0)
+        self.assertEqual(len(res_invalid_pm.data['results']), 0)
+
+        # 4. Combined payment_method + status
+        res_comb = self.client.get('/api/v1/admin/orders/?payment_method=Card&status=delivered')
+        self.assertEqual(res_comb.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_comb.data['count'], 1)
+        self.assertEqual(res_comb.data['results'][0]['order_number'], 'PM_CARD_01')
+
+        res_comb_nomatch = self.client.get('/api/v1/admin/orders/?payment_method=Card&status=placed')
+        self.assertEqual(res_comb_nomatch.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_comb_nomatch.data['count'], 0)
+
     # 5. Customer Management Tests
     def test_admin_list_customers(self):
         self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
@@ -1349,6 +1874,303 @@ class AdminManagementSystemAPITests(APITestCase):
         self.assertEqual(self.customer.profile.role, 'manager')
         self.assertTrue(self.customer.is_staff)
 
+    def test_admin_customers_pagination(self):
+        """
+        Phase 4: Customer list pagination:
+        - Page 1 returns correct page_size (20) and total_pages
+        - Page 2 returns remaining items
+        - Invalid page number returns HTTP 404
+        """
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        # Create 22 additional customer users
+        for i in range(22):
+            User.objects.create_user(
+                username=f'cust_page_{i:02d}',
+                password='Password123!',
+                email=f'cust_page_{i:02d}@freshdash.local'
+            )
+
+        # Page 1
+        res_p1 = self.client.get('/api/v1/admin/customers/?page=1')
+        self.assertEqual(res_p1.status_code, status.HTTP_200_OK)
+        self.assertGreaterEqual(res_p1.data['count'], 25)
+        self.assertGreaterEqual(res_p1.data['total_pages'], 2)
+        self.assertEqual(res_p1.data['current_page'], 1)
+        self.assertEqual(len(res_p1.data['results']), 20)
+
+        # Page 2
+        res_p2 = self.client.get('/api/v1/admin/customers/?page=2')
+        self.assertEqual(res_p2.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_p2.data['current_page'], 2)
+        self.assertGreaterEqual(len(res_p2.data['results']), 5)
+
+        # Invalid page
+        res_invalid = self.client.get('/api/v1/admin/customers/?page=9999')
+        self.assertEqual(res_invalid.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_admin_customers_search(self):
+        """
+        Phase 4: Customer search across username, email, first_name, last_name, phone_number
+        """
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        target_user = User.objects.create_user(
+            username='samuel_search_target',
+            password='Password123!',
+            email='samuel_unique@target.org',
+            first_name='Samuel',
+            last_name='Jackson'
+        )
+        if hasattr(target_user, 'profile'):
+            target_user.profile.phone_number = '9876543210'
+            target_user.profile.save()
+        else:
+            UserProfile.objects.create(user=target_user, phone_number='9876543210')
+
+        # 1. Search by username
+        res_uname = self.client.get('/api/v1/admin/customers/?search=samuel_search_target')
+        self.assertEqual(res_uname.status_code, status.HTTP_200_OK)
+        results = res_uname.data['results']
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]['username'], 'samuel_search_target')
+
+        # 2. Search by email
+        res_email = self.client.get('/api/v1/admin/customers/?search=samuel_unique@target.org')
+        self.assertEqual(res_email.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(res_email.data['results']), 1)
+        self.assertEqual(res_email.data['results'][0]['email'], 'samuel_unique@target.org')
+
+        # 3. Search by first_name
+        res_fname = self.client.get('/api/v1/admin/customers/?search=Samuel')
+        self.assertEqual(res_fname.status_code, status.HTTP_200_OK)
+        self.assertTrue(any(c['username'] == 'samuel_search_target' for c in res_fname.data['results']))
+
+        # 4. Search by phone_number
+        res_phone = self.client.get('/api/v1/admin/customers/?search=9876543210')
+        self.assertEqual(res_phone.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(res_phone.data['results']), 1)
+        self.assertEqual(res_phone.data['results'][0]['username'], 'samuel_search_target')
+
+        # 5. Search non-existent
+        res_none = self.client.get('/api/v1/admin/customers/?search=non_existent_zebra_xyz')
+        self.assertEqual(res_none.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(res_none.data['results']), 0)
+
+    def test_admin_customers_role_filtering(self):
+        """
+        Phase 4: Customer filtering by role (customer, admin, manager)
+        """
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+
+        # 1. Consumer customers
+        res_cust = self.client.get('/api/v1/admin/customers/?role=customer')
+        self.assertEqual(res_cust.status_code, status.HTTP_200_OK)
+        results_cust = res_cust.data['results']
+        self.assertTrue(len(results_cust) > 0)
+        self.assertTrue(all(c['role'] == 'customer' for c in results_cust))
+
+        # 2. Admins
+        res_admin = self.client.get('/api/v1/admin/customers/?role=admin')
+        self.assertEqual(res_admin.status_code, status.HTTP_200_OK)
+        results_admin = res_admin.data['results']
+        self.assertTrue(len(results_admin) > 0)
+        self.assertTrue(all(c['role'] == 'admin' for c in results_admin))
+
+        # 3. Managers
+        res_mgr = self.client.get('/api/v1/admin/customers/?role=manager')
+        self.assertEqual(res_mgr.status_code, status.HTTP_200_OK)
+        results_mgr = res_mgr.data['results']
+        self.assertTrue(len(results_mgr) > 0)
+        self.assertTrue(all(c['role'] == 'manager' for c in results_mgr))
+
+    def test_admin_customers_active_filtering(self):
+        """
+        Phase 4: Customer filtering by is_active=true / false
+        """
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        inactive_user = User.objects.create_user(
+            username='blocked_brian',
+            password='Password123!',
+            email='brian@blocked.local',
+            is_active=False
+        )
+
+        # 1. Active filter (is_active=true)
+        res_act = self.client.get('/api/v1/admin/customers/?is_active=true')
+        self.assertEqual(res_act.status_code, status.HTTP_200_OK)
+        self.assertTrue(all(c['is_active'] is True for c in res_act.data['results']))
+        self.assertFalse(any(c['username'] == 'blocked_brian' for c in res_act.data['results']))
+
+        # 2. Inactive filter (is_active=false)
+        res_inact = self.client.get('/api/v1/admin/customers/?is_active=false')
+        self.assertEqual(res_inact.status_code, status.HTTP_200_OK)
+        self.assertTrue(all(c['is_active'] is False for c in res_inact.data['results']))
+        self.assertTrue(any(c['username'] == 'blocked_brian' for c in res_inact.data['results']))
+
+    def test_admin_customers_combined_search_and_filters(self):
+        """
+        Phase 4: Customer combined search + role + active status filtering
+        """
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        user = User.objects.create_user(
+            username='combo_user_charlotte',
+            password='Password123!',
+            email='charlotte@combo.local',
+            is_active=True
+        )
+        if hasattr(user, 'profile'):
+            user.profile.role = 'customer'
+            user.profile.save()
+
+        # Match all three
+        res_match = self.client.get('/api/v1/admin/customers/?search=combo_user&role=customer&is_active=true')
+        self.assertEqual(res_match.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(res_match.data['results']), 1)
+        self.assertEqual(res_match.data['results'][0]['username'], 'combo_user_charlotte')
+
+        # Conflict on role -> 0 results
+        res_nomatch = self.client.get('/api/v1/admin/customers/?search=combo_user&role=admin&is_active=true')
+        self.assertEqual(res_nomatch.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(res_nomatch.data['results']), 0)
+
+    def test_admin_customers_sorting_orders_count(self):
+        """
+        Phase 4: Dynamic sorting by orders_count (asc and desc)
+        """
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        u_high = User.objects.create_user(username='cust_high_orders', password='P1', email='h@orders.com')
+        u_mid = User.objects.create_user(username='cust_mid_orders', password='P1', email='m@orders.com')
+        u_zero = User.objects.create_user(username='cust_zero_orders', password='P1', email='z@orders.com')
+
+        # High orders = 3
+        for i in range(3):
+            Order.objects.create(
+                order_number=f'HIGH_ORD_{i}',
+                user=u_high,
+                status='placed',
+                item_total=Decimal('10.00'),
+                grand_total=Decimal('10.00')
+            )
+        # Mid orders = 1
+        Order.objects.create(
+            order_number='MID_ORD_1',
+            user=u_mid,
+            status='placed',
+            item_total=Decimal('10.00'),
+            grand_total=Decimal('10.00')
+        )
+
+        # 1. Descending: orders_count high to low
+        res_desc = self.client.get('/api/v1/admin/customers/?search=cust_&ordering=-orders_count')
+        self.assertEqual(res_desc.status_code, status.HTTP_200_OK)
+        counts_desc = [c['orders_count'] for c in res_desc.data['results'] if c['username'] in ['cust_high_orders', 'cust_mid_orders', 'cust_zero_orders']]
+        self.assertEqual(counts_desc, [3, 1, 0])
+
+        # 2. Ascending: orders_count low to high
+        res_asc = self.client.get('/api/v1/admin/customers/?search=cust_&ordering=orders_count')
+        self.assertEqual(res_asc.status_code, status.HTTP_200_OK)
+        counts_asc = [c['orders_count'] for c in res_asc.data['results'] if c['username'] in ['cust_high_orders', 'cust_mid_orders', 'cust_zero_orders']]
+        self.assertEqual(counts_asc, [0, 1, 3])
+
+    def test_admin_customers_sorting_total_spent(self):
+        """
+        Phase 4: Dynamic sorting by total_spent (asc and desc)
+        """
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        u_rich = User.objects.create_user(username='cust_rich_spender', password='P1', email='r@spent.com')
+        u_mod = User.objects.create_user(username='cust_mod_spender', password='P1', email='m@spent.com')
+        u_none = User.objects.create_user(username='cust_none_spender', password='P1', email='n@spent.com')
+
+        Order.objects.create(
+            order_number='RICH_ORD_1',
+            user=u_rich,
+            status='delivered',
+            item_total=Decimal('500.00'),
+            grand_total=Decimal('500.00')
+        )
+        Order.objects.create(
+            order_number='MOD_ORD_1',
+            user=u_mod,
+            status='confirmed',
+            item_total=Decimal('150.00'),
+            grand_total=Decimal('150.00')
+        )
+
+        # 1. Descending total_spent
+        res_desc = self.client.get('/api/v1/admin/customers/?search=cust_&ordering=-total_spent')
+        self.assertEqual(res_desc.status_code, status.HTTP_200_OK)
+        spents_desc = [float(c['total_spent']) for c in res_desc.data['results'] if c['username'] in ['cust_rich_spender', 'cust_mod_spender', 'cust_none_spender']]
+        self.assertEqual(spents_desc, [500.0, 150.0, 0.0])
+
+        # 2. Ascending total_spent
+        res_asc = self.client.get('/api/v1/admin/customers/?search=cust_&ordering=total_spent')
+        self.assertEqual(res_asc.status_code, status.HTTP_200_OK)
+        spents_asc = [float(c['total_spent']) for c in res_asc.data['results'] if c['username'] in ['cust_rich_spender', 'cust_mod_spender', 'cust_none_spender']]
+        self.assertEqual(spents_asc, [0.0, 150.0, 500.0])
+
+    def test_admin_customers_zero_orders_and_business_rules_total_spent(self):
+        """
+        Phase 4: Verify business rules:
+        - Customer without orders receives orders_count=0 and total_spent=0.00
+        - Cancelled orders are excluded from total_spent but included in orders_count
+        """
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        u_mixed = User.objects.create_user(username='cust_mixed_orders', password='P1', email='mix@orders.com')
+
+        # Placed order (50.00)
+        Order.objects.create(
+            order_number='MIX_ORD_VALID',
+            user=u_mixed,
+            status='placed',
+            item_total=Decimal('50.00'),
+            grand_total=Decimal('50.00')
+        )
+        # Cancelled order (100.00) -> should be excluded from total_spent
+        Order.objects.create(
+            order_number='MIX_ORD_CANCEL',
+            user=u_mixed,
+            status='cancelled',
+            item_total=Decimal('100.00'),
+            grand_total=Decimal('100.00')
+        )
+
+        res = self.client.get(f'/api/v1/admin/customers/{u_mixed.id}/')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data['orders_count'], 2)  # 2 orders placed
+        self.assertEqual(float(res.data['total_spent']), 50.0)  # Cancelled 100.00 strictly excluded
+
+    def test_admin_customers_auth_and_rbac(self):
+        """
+        Phase 4: Authorization and RBAC:
+        - Admin accesses successfully (200)
+        - Consumer role receives HTTP 403 Forbidden
+        - Unauthenticated request receives HTTP 401 Unauthorized
+        """
+        # 1. Unauthenticated -> 401
+        self.client.credentials()  # Clear auth
+        res_unauth = self.client.get('/api/v1/admin/customers/')
+        self.assertEqual(res_unauth.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        # 2. Consumer token -> 403
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.customer_access}')
+        res_forbidden = self.client.get('/api/v1/admin/customers/')
+        self.assertEqual(res_forbidden.status_code, status.HTTP_403_FORBIDDEN)
+
+        # 3. Admin token -> 200
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        res_ok = self.client.get('/api/v1/admin/customers/')
+        self.assertEqual(res_ok.status_code, status.HTTP_200_OK)
+
+    def test_admin_customers_self_deactivation_protection(self):
+        """
+        Phase 4: Admin cannot deactivate their own administrative account
+        """
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        res = self.client.post(f'/api/v1/admin/customers/{self.admin.id}/toggle-status/')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('cannot deactivate your own', res.data['message'])
+        self.admin.refresh_from_db()
+        self.assertTrue(self.admin.is_active)
+
     # 6. Inventory & Stock Detection Tests
     def test_inventory_list_and_filters(self):
         self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
@@ -1377,6 +2199,277 @@ class AdminManagementSystemAPITests(APITestCase):
         self.product_carrot.refresh_from_db()
         self.assertEqual(self.product_spinach.stock, 80)
         self.assertEqual(self.product_carrot.stock, 25)
+
+    # Phase 5: Inventory Management Regression Tests
+    def test_inventory_batch_adjust_negative_stock_p0_bug_returns_400(self):
+        """
+        Phase 5 P0 Bug Fix: Negative stock adjustment in batch_adjust must return
+        HTTP 400 Bad Request and not crash with an unhandled NameError (HTTP 500).
+        """
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        initial_stock = self.product_spinach.stock  # 50
+        payload = {
+            'adjustments': [
+                {'product_id': 'spinach', 'adjustment': -100}  # 50 - 100 < 0
+            ]
+        }
+        res = self.client.post('/api/v1/admin/inventory/batch-adjust/', payload, format='json')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.product_spinach.refresh_from_db()
+        self.assertEqual(self.product_spinach.stock, initial_stock)
+
+    def test_inventory_batch_adjust_atomic_rollback(self):
+        """
+        Phase 5: If any product adjustment in a batch fails validation,
+        all previous updates in the transaction must be rolled back atomically.
+        """
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        spinach_initial = self.product_spinach.stock  # 50
+        carrot_initial = self.product_carrot.stock    # 8
+
+        payload = {
+            'adjustments': [
+                {'product_id': 'spinach', 'adjustment': 20},     # Valid: 50 -> 70
+                {'product_id': 'carrot', 'adjustment': -50},     # Invalid: 8 - 50 = -42 < 0
+            ]
+        }
+        res = self.client.post('/api/v1/admin/inventory/batch-adjust/', payload, format='json')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Confirm atomicity: spinach must NOT have been updated to 70
+        self.product_spinach.refresh_from_db()
+        self.product_carrot.refresh_from_db()
+        self.assertEqual(self.product_spinach.stock, spinach_initial)
+        self.assertEqual(self.product_carrot.stock, carrot_initial)
+
+    def test_inventory_single_stock_adjustment(self):
+        """
+        Phase 5: Single stock adjustment via POST /admin/inventory/adjust/
+        Supports delta (+/-) and absolute units, rejecting invalid negative stock.
+        """
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+
+        # 1. Valid positive delta
+        res = self.client.post('/api/v1/admin/inventory/adjust/', {'product_id': 'spinach', 'adjustment': 15})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.product_spinach.refresh_from_db()
+        self.assertEqual(self.product_spinach.stock, 65)
+
+        # 2. Valid absolute stock
+        res2 = self.client.post('/api/v1/admin/inventory/adjust/', {'product_id': 'carrot', 'stock': 45})
+        self.assertEqual(res2.status_code, status.HTTP_200_OK)
+        self.product_carrot.refresh_from_db()
+        self.assertEqual(self.product_carrot.stock, 45)
+
+        # 3. Invalid delta dropping stock below 0
+        res3 = self.client.post('/api/v1/admin/inventory/adjust/', {'product_id': 'spinach', 'adjustment': -100})
+        self.assertEqual(res3.status_code, status.HTTP_400_BAD_REQUEST)
+        self.product_spinach.refresh_from_db()
+        self.assertEqual(self.product_spinach.stock, 65)
+
+    def test_inventory_zero_stock_and_availability_sync(self):
+        """
+        Phase 5: Stock reaching 0 must automatically set is_available = False.
+        Replenishing stock above 0 must automatically reactivate is_available = True.
+        """
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        self.assertTrue(self.product_spinach.is_available)
+
+        # Reduce to zero
+        res = self.client.post('/api/v1/admin/inventory/adjust/', {'product_id': 'spinach', 'stock': 0})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.product_spinach.refresh_from_db()
+        self.assertEqual(self.product_spinach.stock, 0)
+        self.assertFalse(self.product_spinach.is_available)
+
+        # Replenish stock via delta
+        res2 = self.client.post('/api/v1/admin/inventory/adjust/', {'product_id': 'spinach', 'adjustment': 25})
+        self.assertEqual(res2.status_code, status.HTTP_200_OK)
+        self.product_spinach.refresh_from_db()
+        self.assertEqual(self.product_spinach.stock, 25)
+        self.assertTrue(self.product_spinach.is_available)
+
+    def test_inventory_invalid_adjustment_payloads(self):
+        """
+        Phase 5: Validate missing fields, invalid types, empty batch, and non-existent products.
+        """
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+
+        # Missing product_id
+        res1 = self.client.post('/api/v1/admin/inventory/adjust/', {'adjustment': 10})
+        self.assertEqual(res1.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Missing both stock and adjustment
+        res2 = self.client.post('/api/v1/admin/inventory/adjust/', {'product_id': 'spinach'})
+        self.assertEqual(res2.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Non-existent product
+        res3 = self.client.post('/api/v1/admin/inventory/adjust/', {'product_id': 'non_existent_xyz', 'stock': 10})
+        self.assertEqual(res3.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Negative absolute stock
+        res4 = self.client.post('/api/v1/admin/inventory/adjust/', {'product_id': 'spinach', 'stock': -5})
+        self.assertEqual(res4.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Empty adjustments list
+        res5 = self.client.post('/api/v1/admin/inventory/batch-adjust/', {'adjustments': []}, format='json')
+        self.assertEqual(res5.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_inventory_pagination_and_page_size(self):
+        """
+        Phase 5: Test server-side pagination with page and page_size parameters.
+        """
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        # Create additional products to have 5 total
+        Product.objects.create(id='banana', name='Banana', weight='1 kg', price=Decimal('40.00'), original=Decimal('45.00'), stock=30, photo=1, category=self.category_veg)
+        Product.objects.create(id='apple', name='Royal Apple', weight='1 kg', price=Decimal('150.00'), original=Decimal('180.00'), stock=20, photo=2, category=self.category_veg)
+
+        # Page 1 with page_size=2
+        res1 = self.client.get('/api/v1/admin/inventory/?page=1&page_size=2')
+        self.assertEqual(res1.status_code, status.HTTP_200_OK)
+        self.assertEqual(res1.data['count'], 5)
+        self.assertEqual(res1.data['total_items'], 5)
+        self.assertEqual(res1.data['total_pages'], 3)
+        self.assertEqual(res1.data['current_page'], 1)
+        self.assertEqual(res1.data['page_size'], 2)
+        self.assertEqual(len(res1.data['inventory']), 2)
+
+        # Page 2 with page_size=2
+        res2 = self.client.get('/api/v1/admin/inventory/?page=2&page_size=2')
+        self.assertEqual(res2.status_code, status.HTTP_200_OK)
+        self.assertEqual(res2.data['current_page'], 2)
+        self.assertEqual(len(res2.data['inventory']), 2)
+
+        # Verify page 1 and page 2 items are distinct
+        page1_ids = {p['id'] for p in res1.data['inventory']}
+        page2_ids = {p['id'] for p in res2.data['inventory']}
+        self.assertEqual(len(page1_ids.intersection(page2_ids)), 0)
+
+    def test_inventory_invalid_page_numbers_safely_handled(self):
+        """
+        Phase 5: Negative, non-integer, and out-of-range page numbers must be handled safely
+        without crashing (returns HTTP 200 with fallback page).
+        """
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+
+        # Negative page
+        res1 = self.client.get('/api/v1/admin/inventory/?page=-3')
+        self.assertEqual(res1.status_code, status.HTTP_200_OK)
+        self.assertEqual(res1.data['current_page'], 1)
+
+        # Non-integer page
+        res2 = self.client.get('/api/v1/admin/inventory/?page=invalid_string')
+        self.assertEqual(res2.status_code, status.HTTP_200_OK)
+        self.assertEqual(res2.data['current_page'], 1)
+
+        # Out of range page clamped to total_pages
+        res3 = self.client.get('/api/v1/admin/inventory/?page=9999&page_size=2')
+        self.assertEqual(res3.status_code, status.HTTP_200_OK)
+        self.assertLessEqual(res3.data['current_page'], res3.data['total_pages'])
+
+    def test_inventory_sorting_allowlist(self):
+        """
+        Phase 5: Ordering by stock, name, category (asc and desc) with deterministic tie-breaker.
+        Arbitrary or unsupported ordering parameters must be safely ignored.
+        """
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+
+        # 1. Stock Ascending
+        res_stock_asc = self.client.get('/api/v1/admin/inventory/?ordering=stock')
+        self.assertEqual(res_stock_asc.status_code, status.HTTP_200_OK)
+        stocks_asc = [p['stock'] for p in res_stock_asc.data['inventory']]
+        self.assertEqual(stocks_asc, sorted(stocks_asc))
+
+        # 2. Stock Descending
+        res_stock_desc = self.client.get('/api/v1/admin/inventory/?ordering=-stock')
+        self.assertEqual(res_stock_desc.status_code, status.HTTP_200_OK)
+        stocks_desc = [p['stock'] for p in res_stock_desc.data['inventory']]
+        self.assertEqual(stocks_desc, sorted(stocks_desc, reverse=True))
+
+        # 3. Name Ascending
+        res_name_asc = self.client.get('/api/v1/admin/inventory/?ordering=name')
+        self.assertEqual(res_name_asc.status_code, status.HTTP_200_OK)
+        names_asc = [p['name'] for p in res_name_asc.data['inventory']]
+        self.assertEqual(names_asc, sorted(names_asc))
+
+        # 4. Unsupported ordering safely falls back to default
+        res_bad = self.client.get('/api/v1/admin/inventory/?ordering=unsupported_field_inject')
+        self.assertEqual(res_bad.status_code, status.HTTP_200_OK)
+        bad_stocks = [p['stock'] for p in res_bad.data['inventory']]
+        self.assertEqual(bad_stocks, sorted(bad_stocks))
+
+    def test_inventory_category_filtering(self):
+        """
+        Phase 5: Filter inventory by category ID.
+        """
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+        # Create product in dairy category
+        Product.objects.create(
+            id='milk_bottle',
+            name='Farm Fresh Milk',
+            weight='1 L',
+            price=Decimal('60.00'),
+            original=Decimal('65.00'),
+            stock=15,
+            photo=6,
+            category=self.category_empty
+        )
+
+        # Filter by dairy
+        res_dairy = self.client.get('/api/v1/admin/inventory/?category=dairy')
+        self.assertEqual(res_dairy.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_dairy.data['count'], 1)
+        self.assertEqual(res_dairy.data['inventory'][0]['id'], 'milk_bottle')
+
+        # Filter by vegetables
+        res_veg = self.client.get('/api/v1/admin/inventory/?category=vegetables')
+        self.assertEqual(res_veg.status_code, status.HTTP_200_OK)
+        self.assertTrue(all(p['category_id'] == 'vegetables' for p in res_veg.data['inventory']))
+
+    def test_inventory_combined_filters(self):
+        """
+        Phase 5: Verify combined search, category, and status filters.
+        """
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.admin_access}')
+
+        # Search 'spin' + category 'vegetables' + filter 'in_stock'
+        res = self.client.get('/api/v1/admin/inventory/?search=spin&category=vegetables&filter=in_stock')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data['count'], 1)
+        self.assertEqual(res.data['inventory'][0]['id'], 'spinach')
+
+        # Search 'spin' + filter 'low_stock' -> 0 items (spinach has 50 stock)
+        res_empty = self.client.get('/api/v1/admin/inventory/?search=spin&filter=low_stock')
+        self.assertEqual(res_empty.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_empty.data['count'], 0)
+
+    def test_inventory_rbac_protection(self):
+        """
+        Phase 5: Inventory endpoints require admin authentication (401 unauthenticated, 403 customer).
+        """
+        # 1. Unauthenticated list
+        self.client.credentials()  # Clear credentials
+        res1 = self.client.get('/api/v1/admin/inventory/')
+        self.assertEqual(res1.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        # 2. Customer list
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.customer_access}')
+        res2 = self.client.get('/api/v1/admin/inventory/')
+        self.assertEqual(res2.status_code, status.HTTP_403_FORBIDDEN)
+
+        # 3. Unauthenticated adjust
+        self.client.credentials()
+        res3 = self.client.post('/api/v1/admin/inventory/adjust/', {'product_id': 'spinach', 'stock': 20})
+        self.assertEqual(res3.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        # 4. Customer adjust
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.customer_access}')
+        res4 = self.client.post('/api/v1/admin/inventory/adjust/', {'product_id': 'spinach', 'stock': 20})
+        self.assertEqual(res4.status_code, status.HTTP_403_FORBIDDEN)
+
+        # 5. Customer batch-adjust
+        res5 = self.client.post('/api/v1/admin/inventory/batch-adjust/', {'adjustments': [{'product_id': 'spinach', 'stock': 20}]}, format='json')
+        self.assertEqual(res5.status_code, status.HTTP_403_FORBIDDEN)
 
     # 7. Customer Order Placement Decrements Stock Atomically
     def test_customer_order_decrements_stock(self):
