@@ -25,9 +25,7 @@ FREE_DELIVERY_THRESHOLD = Decimal('199.00')
 STANDARD_DELIVERY_FEE = Decimal('20.00')
 
 
-# -----------------------------------------------------------------------------
-# User & Authentication Serializers
-# -----------------------------------------------------------------------------
+# User & Authentication
 
 class UserProfileSerializer(serializers.ModelSerializer):
     class Meta:
@@ -164,9 +162,7 @@ class ProfileUpdateSerializer(serializers.ModelSerializer):
         return instance
 
 
-# -----------------------------------------------------------------------------
-# Category & Product Serializers
-# -----------------------------------------------------------------------------
+# Category & Product
 
 class CategorySerializer(serializers.ModelSerializer):
     products_count = serializers.SerializerMethodField()
@@ -225,9 +221,7 @@ class ProductSerializer(serializers.ModelSerializer):
         return attrs
 
 
-# -----------------------------------------------------------------------------
-# Address Serializers
-# -----------------------------------------------------------------------------
+# Address
 
 class AddressSerializer(serializers.ModelSerializer):
     user = serializers.HiddenField(default=serializers.CurrentUserDefault())
@@ -253,9 +247,7 @@ class AddressSerializer(serializers.ModelSerializer):
         return value.strip()
 
 
-# -----------------------------------------------------------------------------
-# Cart Serializers
-# -----------------------------------------------------------------------------
+# Cart
 
 class CartItemSerializer(serializers.ModelSerializer):
     product = ProductSerializer(read_only=True)
@@ -323,9 +315,7 @@ class CartItemQuantityUpdateSerializer(serializers.Serializer):
         return attrs
 
 
-# -----------------------------------------------------------------------------
-# Coupon & Offers Serializers
-# -----------------------------------------------------------------------------
+# Coupon & Offers
 
 class CouponSerializer(serializers.ModelSerializer):
     discount_percentage = serializers.SerializerMethodField()
@@ -360,9 +350,7 @@ class ApplyCouponSerializer(serializers.Serializer):
         return code
 
 
-# -----------------------------------------------------------------------------
-# Order Serializers
-# -----------------------------------------------------------------------------
+# Order
 
 class OrderItemSerializer(serializers.ModelSerializer):
     class Meta:
@@ -511,9 +499,7 @@ class OrderCreateSerializer(serializers.Serializer):
         return order
 
 
-# -----------------------------------------------------------------------------
-# Favorite & FAQ Serializers
-# -----------------------------------------------------------------------------
+# Favorite & FAQ
 
 class FavoriteProductSerializer(serializers.ModelSerializer):
     product = ProductSerializer(read_only=True)
@@ -541,9 +527,7 @@ class FAQSerializer(serializers.ModelSerializer):
         fields = ['id', 'question', 'answer', 'order']
 
 
-# -----------------------------------------------------------------------------
-# Admin Management System Serializers
-# -----------------------------------------------------------------------------
+# Admin Management System
 
 class AdminLoginSerializer(serializers.Serializer):
     """

@@ -65,9 +65,7 @@ from .permissions import IsOwner, IsAdminOrReadOnly, IsAdminRole
 from .filters import ProductFilter
 
 
-# -----------------------------------------------------------------------------
-# System & Authentication Views
-# -----------------------------------------------------------------------------
+# System & Authentication
 
 @extend_schema(
     responses={
@@ -250,9 +248,7 @@ class ProfileView(APIView):
         )
 
 
-# -----------------------------------------------------------------------------
-# Category ViewSet
-# -----------------------------------------------------------------------------
+# Category
 
 class CategoryViewSet(viewsets.ReadOnlyModelViewSet):
     """
@@ -275,9 +271,7 @@ class CategoryViewSet(viewsets.ReadOnlyModelViewSet):
         return Response(serializer.data)
 
 
-# -----------------------------------------------------------------------------
-# Product ViewSet
-# -----------------------------------------------------------------------------
+# Product
 
 class ProductViewSet(viewsets.ModelViewSet):
     """
@@ -327,9 +321,7 @@ class ProductViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
 
-# -----------------------------------------------------------------------------
-# Cart ViewSet
-# -----------------------------------------------------------------------------
+# Cart
 
 class CartViewSet(viewsets.ViewSet):
     """
@@ -489,9 +481,7 @@ class CartViewSet(viewsets.ViewSet):
         )
 
 
-# -----------------------------------------------------------------------------
-# Address ViewSet
-# -----------------------------------------------------------------------------
+# Address
 
 class AddressViewSet(viewsets.ModelViewSet):
     """
@@ -527,9 +517,7 @@ class AddressViewSet(viewsets.ModelViewSet):
         )
 
 
-# -----------------------------------------------------------------------------
-# Order ViewSet
-# -----------------------------------------------------------------------------
+# Order
 
 class OrderViewSet(viewsets.ModelViewSet):
     """
@@ -619,9 +607,7 @@ class OrderViewSet(viewsets.ModelViewSet):
         )
 
 
-# -----------------------------------------------------------------------------
-# Coupon ViewSet
-# -----------------------------------------------------------------------------
+# Coupon
 
 class CouponViewSet(viewsets.ReadOnlyModelViewSet):
     """
@@ -664,9 +650,7 @@ class CouponViewSet(viewsets.ReadOnlyModelViewSet):
         )
 
 
-# -----------------------------------------------------------------------------
-# Favorite ViewSet
-# -----------------------------------------------------------------------------
+# Favorite
 
 class FavoriteViewSet(viewsets.ModelViewSet):
     """
@@ -713,9 +697,7 @@ class FavoriteViewSet(viewsets.ModelViewSet):
         )
 
 
-# -----------------------------------------------------------------------------
-# FAQ ViewSet
-# -----------------------------------------------------------------------------
+# FAQ
 
 class FAQViewSet(viewsets.ReadOnlyModelViewSet):
     """
@@ -726,9 +708,7 @@ class FAQViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [permissions.AllowAny]
 
 
-# -----------------------------------------------------------------------------
-# Admin Management System Views
-# -----------------------------------------------------------------------------
+# Admin Management System
 
 class AdminLoginView(APIView):
     """
